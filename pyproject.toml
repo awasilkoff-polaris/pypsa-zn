@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pypsa==0.35.2",
     "numpy",
-    "pandas",
+    "pandas<3",          # pypsa 0.35.2 plotting breaks on pandas 3.0 StringDtype
     "matplotlib",
     "scipy",
     "networkx",
