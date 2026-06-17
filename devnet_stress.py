@@ -527,6 +527,18 @@ else:
 print(f"ASR-DBG::Using DEVNET_NAME::\n\t{DEVNET_NAME}\n")
 
 # ------------------------------------------------------------------------------
+#   Select solver engine (default from DEVNET_ENGINE env var; menu can override)
+# ------------------------------------------------------------------------------
+_eng_default = "2" if dsl.get_engine() == "pso" else "1"
+print("Select solver engine:")
+print("  1) PyPSA (built-in LP)")
+print("  2) PSO   (AIMMS, via aimmspy)")
+_eng_choice = input(f"Enter choice [{_eng_default}]: ").strip() or _eng_default
+dsl.set_engine("pso" if _eng_choice == "2" else "pypsa")
+
+print(f"ASR-DBG::Using ENGINE::\n\t{dsl.get_engine()}\n")
+
+# ------------------------------------------------------------------------------
 #   Define DevNet Log & CSV/Excel paths
 # ------------------------------------------------------------------------------
 DEVNET_BLD_PATH = os.path.join(SCRIPT_DIR, DEVNET_NAME)

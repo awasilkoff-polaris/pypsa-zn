@@ -1,0 +1,33 @@
+# Lightweight scenario spec for the PyPSA -> PSO converter.
+#
+# The base network is read from a PyPSA CSV folder (the same format devnet_sld.py
+# exports and devnet_stress.py consumes). Each scenario applies the repo's own
+# stress levers as small dicts -- identical in meaning to devnet_stress.py's
+# --k_load / --k_line / --mc_bus / --mc_mode -- and the converter writes one PSO
+# 3.3 input case per scenario into out_dir/<name>/.
+
+base_network: devnet-reference-runs/devnet-sld-20Mar2026   # PyPSA CSV folder
+out_dir: pso/cases
+slack_bus: SPP_MISO
+horizon:
+  start: "2012.01.02 00:00"      # single interval
+  interval_hours: 1
+
+scenarios:
+  - name: baseline
+    # no perturbations -> reproduces the PyPSA baseline (obj 1,500,000; LMP 50)
+
+  - name: mc_gradient
+    # validated non-degenerate case (obj 770,000; LMPs 20/20/30/40/50/60)
+    mc_bus: {WECC_NW: 10, WECC_SW: 20, SPP_MISO: 30, PJM_NE: 40, SERC_SE: 50, ERCOT: 60}
+    mc_mode: set
+
+  - name: derate_sw_spp
+    # derate the western bridge to 50% (combine with mc to force more congestion)
+    mc_bus: {WECC_NW: 10, WECC_SW: 20, SPP_MISO: 30, PJM_NE: 40, SERC_SE: 50, ERCOT: 60}
+    mc_mode: set
+    k_line: {L_WECC_SW_SPP_MISO: 0.5}
+
+  - name: load_growth_pjm
+    # 40% load growth at PJM_NE
+    k_load: {PJM_NE: 1.4}

@@ -1,0 +1,32 @@
+# PSO engine config for the DevNet repo.
+# Copy this file to `pso.local.toml` (gitignored) and edit for your machine.
+# Any DEVNET_PSO_* environment variable overrides the matching value here.
+
+# Solver engine: "pypsa" (built-in LP) or "pso".
+engine = "pso"
+
+# Run backend: "local" (aimmspy, uses your own AIMMS + license) or "docker".
+runner = "local"
+
+# PSO input format: "3.2" (// headers, MDL_ID MinorRelease=2) or "3.3".
+# "3.2" is portable -- it runs on real PSO 3.2 AND on 3.3 (which reads // headers
+# and honors MinorRelease=2 in 3.2-compat mode). Use "3.3" only for a 3.3-native run.
+pso_version = "3.2"
+
+# Full path to the PSO model (PSO.aimms). Forward or back slashes both fine.
+project = "D:/path/to/PSO.aimms"
+
+# --- Licensing (local/aimmspy backend) ---
+# Academic / cloud license URL (wss://...). Omit to use the machine's configured
+# AIMMS license (License Configuration default).
+# license_url = "wss://licensing.aimms.cloud/license-ws/license?profile=..."
+
+# --- AIMMS install (optional) ---
+# By default the AIMMS runtime is matched to the installed aimmspy major.minor.
+# Set one of these only if that auto-match doesn't fit your machine:
+# aimms_version = "26.1"
+# aimms_path    = "C:/Users/you/AppData/Local/AIMMS/IFA/Aimms/26.1.4.12-x64-VS2022/Bin"
+
+# --- Docker backend (only if runner = "docker") ---
+# image       = "pso-pso33:3.3-nodelock"
+# docker_args = "--mac-address 02:42:ac:11:00:02 -v pso_nodelock:/data"

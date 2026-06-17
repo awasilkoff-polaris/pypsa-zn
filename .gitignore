@@ -16,9 +16,19 @@ dist/
 # Virtual environments
 # ------------------------------------------------------------------------------
 venv/
+.venv/
+.venv-pso/
 .env/
 .envrc
 .pyenv/
+
+# PSO engine local config (machine-specific paths + license) -- keep the .example
+pso.local.toml
+
+# PSO engine generated outputs / artifacts
+pso/cases/
+*.status
+*.pyi
 
 # ------------------------------------------------------------------------------
 # Jupyter / temp

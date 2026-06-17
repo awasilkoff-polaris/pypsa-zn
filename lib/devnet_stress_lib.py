@@ -67,6 +67,41 @@ SECTION_SEPARATOR = "=" * 80 + "\n"
 SUBSECTION_SEPARATOR = "-" * 40 + "\n"
 
 # ------------------------------------------------------------------------------
+#   Solver engine selection
+#
+#   Default comes from the DEVNET_ENGINE env var ("pypsa" | "pso"), so automation
+#   (demo_runner, CI, the pso/ standalone tools) can pin it. Interactive scripts
+#   can override it at runtime with set_engine() -- e.g. a menu prompt -- without
+#   touching the environment. solve_with_duals() reads the current value per call.
+# ------------------------------------------------------------------------------
+import sys
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
+# Apply pso.local.toml as env defaults BEFORE reading the engine selection, so the
+# config file can set the engine (env still overrides). Best-effort.
+try:
+    _PSO_DIR = os.path.join(os.path.dirname(LIB_DIR), "pso")
+    if _PSO_DIR not in sys.path:
+        sys.path.insert(0, _PSO_DIR)
+    import pso_config
+    pso_config.load_config()
+except Exception:
+    pass
+
+_ENGINE = os.environ.get("DEVNET_ENGINE", "pypsa").lower()
+
+
+def set_engine(name: str) -> None:
+    """Select the solver engine at runtime: 'pypsa' (default) or 'pso'."""
+    global _ENGINE
+    _ENGINE = (name or "pypsa").strip().lower()
+
+
+def get_engine() -> str:
+    return _ENGINE
+
+# ------------------------------------------------------------------------------
 #   Helper functions
 # ------------------------------------------------------------------------------
 def solve_with_duals(n: pypsa.Network, solver: str = "highs") -> tuple[bool, str]:
@@ -74,6 +109,16 @@ def solve_with_duals(n: pypsa.Network, solver: str = "highs") -> tuple[bool, str
     Run optimization and report success/failure.
     Returns (ok, message).
     """
+    # Engine swap: solve with PSO instead of PyPSA's LP. The PSO results are
+    # stashed on the network and returned by collect_results() unchanged.
+    if _ENGINE == "pso":
+        try:
+            import pso_engine
+            n._pso_results = pso_engine.solve_network(n)
+        except Exception as e:
+            return (False, f"PSO solve failed: {e}")
+        return (True, "Optimal (PSO)")
+
     try:
         n.optimize(solver_name=solver, assign_all_duals=True)
     except Exception as e:
@@ -200,6 +245,10 @@ def collect_results(n: pypsa.Network) -> dict:
     """
     Returns snapshot-0 results (DevNet is usually single snapshot).
     """
+    # Engine swap: solve_with_duals() stashed PSO results in collect_results shape.
+    if getattr(n, "_pso_results", None) is not None:
+        return n._pso_results
+
     snap = n.snapshots[0]
 
     out = {
