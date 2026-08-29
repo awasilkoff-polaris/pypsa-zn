@@ -75,7 +75,13 @@ def build_argparser(devnet_bld_path: str) -> argparse.ArgumentParser:
 
     p.add_argument("--k_load", default="{}", help='JSON dict: {"BUS1": 1.2, "BUS3": 1.5}')
     p.add_argument("--k_line", default="{}", help='JSON dict: {"LINE1": 0.8, "LINE2": 0.6}')
+    p.add_argument("--k_gen", default="{}", help='JSON dict: {"WECC_NW": 0.0, "ERCOT": 0.5}')
     p.add_argument("--mc_bus", default="{}", help='JSON dict: {"BUS2": 50, "BUS5": 120}')
+    p.add_argument(
+        "--lmp_bus",
+        default="PJM_NE",
+        help="Bus whose LMP is reported in dashboards.",
+    )
     p.add_argument("--mc_mode", default="set", choices=["set", "add"])
 
     p.add_argument(
@@ -118,12 +124,20 @@ def build_args_catalog(devnet: pypsa.Network) -> dict[str, list[str]]:
             json.dumps({line0: 0.5}),
             "__CUSTOM__",
         ],
+        "k_gen": [
+            "{}",
+            json.dumps({bus0: 0.0}),
+            json.dumps({bus0: 0.5}),
+            "__CUSTOM__",
+        ],
         "mc_bus": [
             "{}",
             json.dumps({bus0: 70}),
             json.dumps({bus0: 100}),
             "__CUSTOM__",
         ],
+
+        "lmp_bus": list(devnet.buses.index),
         "line": (list(devnet.lines.index[:6]) if len(devnet.lines) else [""]) + ["<manual>"],
         "kmin": ["1.0", "0.9", "0.8"],
         "kmax": ["0.5", "0.4", "0.3", "0.2"],
@@ -230,8 +244,8 @@ def prompt_custom_k_line(devnet: pypsa.Network) -> dict[str, float]:
             continue
         try:
             v = float(s)
-            if v <= 0 or v > 1.0:
-                print("    Invalid; must be in (0,1]. Skipped.")
+            if v < 0.0 or v > 1.0:
+                print("    Invalid; must be between 0.0 and 1.0. Skipped.")
                 continue
             if v != 1.0:
                 out[ln] = v
@@ -239,6 +253,36 @@ def prompt_custom_k_line(devnet: pypsa.Network) -> dict[str, float]:
             print("    Invalid number. Skipped.")
     return out
 
+def prompt_custom_k_gen(devnet: pypsa.Network) -> dict[str, float]:
+    print(
+        "\nCustom k_gen "
+        "(per-bus generation capacity multiplier).\n"
+        "Enter 0.0 for full outage, 0.5 for 50% derating, "
+        "1.0 for no change.\n"
+    )
+
+    out = {}
+
+    for bus in devnet.buses.index:
+        s = input(f"  {bus} [default=1.0]: ").strip()
+
+        if not s:
+            continue
+
+        try:
+            value = float(s)
+
+            if value < 0.0 or value > 1.0:
+                print("    Invalid; must be between 0.0 and 1.0. Skipped.")
+                continue
+
+            if value != 1.0:
+                out[bus] = value
+
+        except ValueError:
+            print("    Invalid number. Skipped.")
+
+    return out
 
 def prompt_custom_mc_bus(devnet: pypsa.Network) -> dict[str, float]:
     print("\nCustom mc_bus. Enter USD/MWh. Blank = no change.\n")
@@ -326,13 +370,31 @@ def configure_args_menu(devnet: pypsa.Network, args: argparse.Namespace) -> argp
     else:
         args.k_line = sel
 
+    opts = catalog["k_gen"]
+    sel_gen = _pick_from_menu(
+        "Per-bus generation capacity multiplier (k_gen)",
+        opts,
+        default_idx=opts.index(args.k_gen) if args.k_gen in opts else 0,
+    )
+
+    if sel_gen == "__CUSTOM__":
+        custom_gen = prompt_custom_k_gen(devnet)
+        args.k_gen = json.dumps(custom_gen) if custom_gen else "{}"
+
+        if custom_gen:
+            print("\nCustom k_gen set:")
+
+            for bus, value in custom_gen.items():
+                print(f"  {bus}: {value}")
+    else:
+        args.k_gen = sel_gen
+
     opts = catalog["mc_bus"]
     sel_mc = _pick_from_menu(
         "Per-bus generator marginal cost preset (mc_bus)",
         opts,
         default_idx=opts.index(args.mc_bus) if args.mc_bus in opts else 0,
     )
-
     if sel_mc == "__CUSTOM__":
         custom_mc = prompt_custom_mc_bus(devnet)
         args.mc_bus = json.dumps(custom_mc) if custom_mc else "{}"
@@ -342,6 +404,24 @@ def configure_args_menu(devnet: pypsa.Network, args: argparse.Namespace) -> argp
                 print(f"  {b}: {v}")
     else:
         args.mc_bus = sel_mc
+
+    lmp_buses = list(devnet.buses.index)
+
+    default_lmp_bus = (
+        args.lmp_bus
+        if args.lmp_bus in lmp_buses
+        else "PJM_NE"
+    )
+
+    args.lmp_bus = _pick_from_menu(
+        "Bus whose nodal LMP is reported",
+        lmp_buses,
+        default_idx=(
+            lmp_buses.index(default_lmp_bus)
+            if default_lmp_bus in lmp_buses
+            else 0
+        ),
+    )
 
     opts = catalog.get("byog_mc", ["CSV_PRESET"])
     choice = _pick_from_menu(
@@ -400,7 +480,9 @@ def configure_args_menu(devnet: pypsa.Network, args: argparse.Namespace) -> argp
         "mc_mode",
         "k_load",
         "k_line",
+        "k_gen",
         "mc_bus",
+        "lmp_bus",
         "line",
         "kmin",
         "kmax",
@@ -452,7 +534,10 @@ def researcher_loop(devnet: pypsa.Network, args: argparse.Namespace, catalog: di
         prev = dsl.run_preview(devnet, args, DEVNET_NAME)
 
         if prev["kind"] == "single":
-            dash = dsl._dashboard_from_single(prev["res"])
+            dash = dsl._dashboard_from_single(
+                prev["res"],
+                report_bus=args.lmp_bus,
+            )
             print_dashboard(args, "PREVIEW", dash, devnet)
 
         elif prev["kind"] == "sweep":

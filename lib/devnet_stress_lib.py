@@ -38,7 +38,6 @@ import copy
 import os
 import json
 from pathlib import Path
-from pydoc import html
 
 # ------------------------------------------------------------------
 #   Third-party imports
@@ -151,6 +150,36 @@ def apply_corridor_reducers(n: pypsa.Network, k_line: dict[str, float]) -> None:
         if ln in n.lines.index:
             n.lines.loc[ln, "s_nom"] = n.lines.loc[ln, "s_nom"] * float(k)
 
+def apply_gen_capacity_multipliers(
+    n: pypsa.Network,
+    k_gen: dict[str, float],
+) -> None:
+    """
+    Apply per-bus generator capacity multipliers.
+
+    Examples:
+      1.0 = no change
+      0.5 = 50% derating
+      0.0 = full generator outage
+    """
+    if n.generators.empty:
+        return
+
+    for bus, multiplier in k_gen.items():
+        generators = n.generators.index[
+            n.generators["bus"] == bus
+        ]
+
+        if len(generators) == 0:
+            continue
+
+        n.generators.loc[generators, "p_nom"] = (
+            pd.to_numeric(
+                n.generators.loc[generators, "p_nom"],
+                errors="coerce",
+            ).fillna(0.0)
+            * float(multiplier)
+        )
 
 def apply_gen_marginal_cost_by_bus(n: pypsa.Network, mc_bus: dict[str, float], mode: str = "set") -> None:
     """
@@ -198,64 +227,156 @@ def resolve_dc_csv_values(devnet: pypsa.Network) -> dict:
 # ------------------------------------------------------------------------------
 def collect_results(n: pypsa.Network) -> dict:
     """
-    Returns snapshot-0 results (DevNet is usually single snapshot).
+    Extract solved single-snapshot operating results.
+
+    Sign convention:
+      bus_net_import_mw > 0  -> bus imports from grid
+      bus_net_import_mw < 0  -> bus exports to grid
     """
     snap = n.snapshots[0]
 
     out = {
         "snapshot": str(snap),
-        "objective": float(getattr(n, "objective", np.nan)) if getattr(n, "objective", None) is not None else np.nan,
+        "objective": (
+            float(getattr(n, "objective", np.nan))
+            if getattr(n, "objective", None) is not None
+            else np.nan
+        ),
+        "total_system_load_mw": 0.0,
+        "generator_dispatch_mw": {},
+        "bus_net_import_mw": {},
+        "dc_dispatch_mw": np.nan,
     }
 
-    out["dc_dispatch_mw"] = np.nan
+    # ------------------------------------------------------------------
+    # Total system load
+    # ------------------------------------------------------------------
+    load_dispatch = pd.Series(0.0, index=n.loads.index, dtype=float)
 
-    if hasattr(n, "buses_t") and hasattr(n.buses_t, "marginal_price") and not n.buses_t.marginal_price.empty:
+    if (
+        hasattr(n, "loads_t")
+        and hasattr(n.loads_t, "p")
+        and n.loads_t.p is not None
+        and not n.loads_t.p.empty
+    ):
+        load_dispatch = (
+            pd.to_numeric(n.loads_t.p.loc[snap], errors="coerce")
+            .reindex(n.loads.index)
+            .fillna(0.0)
+        )
+    elif "p_set" in n.loads.columns:
+        load_dispatch = (
+            pd.to_numeric(n.loads["p_set"], errors="coerce")
+            .fillna(0.0)
+        )
+
+    out["total_system_load_mw"] = float(load_dispatch.sum())
+
+    # ------------------------------------------------------------------
+    # Generator dispatch
+    # ------------------------------------------------------------------
+    generator_dispatch = pd.Series(
+        0.0,
+        index=n.generators.index,
+        dtype=float,
+    )
+
+    if (
+        hasattr(n, "generators_t")
+        and hasattr(n.generators_t, "p")
+        and n.generators_t.p is not None
+        and not n.generators_t.p.empty
+    ):
+        generator_dispatch = (
+            pd.to_numeric(n.generators_t.p.loc[snap], errors="coerce")
+            .reindex(n.generators.index)
+            .fillna(0.0)
+        )
+
+    out["generator_dispatch_mw"] = {
+        str(generator): float(dispatch)
+        for generator, dispatch in generator_dispatch.items()
+    }
+
+    # ------------------------------------------------------------------
+    # Bus import / export
+    #
+    # Positive = net grid import
+    # Negative = net grid export
+    # ------------------------------------------------------------------
+    load_by_bus = pd.Series(
+        0.0,
+        index=n.buses.index,
+        dtype=float,
+    )
+
+    if not n.loads.empty:
+        load_by_bus = (
+            load_dispatch.groupby(n.loads["bus"])
+            .sum()
+            .reindex(n.buses.index)
+            .fillna(0.0)
+        )
+
+    generation_by_bus = pd.Series(
+        0.0,
+        index=n.buses.index,
+        dtype=float,
+    )
+
+    if not n.generators.empty:
+        generation_by_bus = (
+            generator_dispatch.groupby(n.generators["bus"])
+            .sum()
+            .reindex(n.buses.index)
+            .fillna(0.0)
+        )
+
+    bus_net_import = load_by_bus - generation_by_bus
+
+    out["bus_net_import_mw"] = {
+        str(bus): float(value)
+        for bus, value in bus_net_import.items()
+    }
+
+    # ------------------------------------------------------------------
+    # LMP
+    # ------------------------------------------------------------------
+    if (
+        hasattr(n, "buses_t")
+        and hasattr(n.buses_t, "marginal_price")
+        and not n.buses_t.marginal_price.empty
+    ):
         out["lmp"] = n.buses_t.marginal_price.loc[snap].to_dict()
     else:
         out["lmp"] = {}
 
-    if hasattr(n, "lines_t") and hasattr(n.lines_t, "p0") and not n.lines_t.p0.empty and not n.lines.empty:
-        loading = (n.lines_t.p0.loc[snap].abs() / n.lines.s_nom).replace([np.inf, -np.inf], np.nan)
+    # ------------------------------------------------------------------
+    # Line loading
+    # ------------------------------------------------------------------
+    if (
+        hasattr(n, "lines_t")
+        and hasattr(n.lines_t, "p0")
+        and not n.lines_t.p0.empty
+        and not n.lines.empty
+    ):
+        loading = (
+            n.lines_t.p0.loc[snap].abs() / n.lines.s_nom
+        ).replace([np.inf, -np.inf], np.nan)
+
         out["line_loading_pu"] = loading.to_dict()
     else:
         out["line_loading_pu"] = {}
 
-    # --------------------------------------------------------------
-    # Datacenter BYOG dispatch
-    #
-    # Only valid for devnetDC-sld where:
-    #
-    #   Gen_DC_PJM_NE
-    #
-    # is dynamically added.
-    # --------------------------------------------------------------
-    try:
-
-        if (
-            "Gen_DC_PJM_NE"
-            not in n.generators.index
-        ):
-            return out
-
-        if (
-            hasattr(n, "generators_t")
-            and hasattr(n.generators_t, "p")
-            and "Gen_DC_PJM_NE" in n.generators_t.p.columns
-        ):
-
-            out["dc_dispatch_mw"] = float(
-                n.generators_t.p.loc[
-                    snap,
-                    "Gen_DC_PJM_NE"
-                ]
-            )
-
-    except Exception:
-
-        pass
+    # ------------------------------------------------------------------
+    # Datacenter BYOG dispatch — devnetDC-sld only
+    # ------------------------------------------------------------------
+    if "Gen_DC_PJM_NE" in generator_dispatch.index:
+        out["dc_dispatch_mw"] = float(
+            generator_dispatch.loc["Gen_DC_PJM_NE"]
+        )
 
     return out
-
 
 # ------------------------------------------------------------------------------
 # write_outputs()
@@ -274,10 +395,40 @@ def write_outputs(outdir: Path, tag: str, results: dict) -> None:
         pd.Series(results["lmp"], name="lmp").to_csv(outdir / f"{tag}_lmp.csv")
 
     if results.get("line_loading_pu"):
-        pd.Series(results["line_loading_pu"], name="loading_pu").to_csv(outdir / f"{tag}_line_loading_pu.csv")
+        pd.Series(
+            results["line_loading_pu"],
+            name="loading_pu",
+        ).to_csv(
+            outdir / f"{tag}_line_loading_pu.csv"
+        )
 
-    pd.Series({"objective": results.get("objective", np.nan)}).to_csv(outdir / f"{tag}_objective.csv")
+    if results.get("generator_dispatch_mw"):
+        pd.Series(
+            results["generator_dispatch_mw"],
+            name="dispatch_mw",
+        ).to_csv(
+            outdir / f"{tag}_generator_dispatch_mw.csv"
+        )
 
+    if results.get("bus_net_import_mw"):
+        pd.Series(
+            results["bus_net_import_mw"],
+            name="net_import_mw",
+        ).to_csv(
+            outdir / f"{tag}_bus_net_import_mw.csv"
+        )
+
+    pd.Series(
+        {
+            "objective": results.get("objective", np.nan),
+            "total_system_load_mw": results.get(
+                "total_system_load_mw",
+                np.nan,
+            ),
+        }
+    ).to_csv(
+        outdir / f"{tag}_objective.csv"
+    )
 
 # ------------------------------------------------------------------------------
 # parse_json_dict()
@@ -318,9 +469,26 @@ def resolve_byog_mc(n: pypsa.Network, args, devnet_name: str):
 def run_single(n0: pypsa.Network, args, tag: str, devnet_name: str) -> dict:
     n = copy.deepcopy(n0)
 
-    apply_load_multipliers(n, parse_json_dict(args.k_load))
-    apply_corridor_reducers(n, parse_json_dict(args.k_line))
-    apply_gen_marginal_cost_by_bus(n, parse_json_dict(args.mc_bus), mode=args.mc_mode)
+    apply_load_multipliers(
+        n,
+        parse_json_dict(args.k_load),
+    )
+
+    apply_corridor_reducers(
+        n,
+        parse_json_dict(args.k_line),
+    )
+
+    apply_gen_capacity_multipliers(
+        n,
+        parse_json_dict(args.k_gen),
+    )
+
+    apply_gen_marginal_cost_by_bus(
+        n,
+        parse_json_dict(args.mc_bus),
+        mode=args.mc_mode,
+    )
 
     if devnet_name == "devnetDC-sld" and "Load_DC_PJM_NE" in n.loads.index:
         byog_p = float(n.loads.at["Load_DC_PJM_NE", "byog_p_nom"])
@@ -363,6 +531,15 @@ def run_single(n0: pypsa.Network, args, tag: str, devnet_name: str) -> dict:
         res = {
             "snapshot": str(n.snapshots[0]),
             "objective": np.nan,
+            "total_system_load_mw": float(
+                pd.to_numeric(
+                    n.loads["p_set"],
+                    errors="coerce",
+                ).fillna(0.0).sum()
+            ),
+            "generator_dispatch_mw": {},
+            "bus_net_import_mw": {},
+            "dc_dispatch_mw": np.nan,
             "lmp": {},
             "line_loading_pu": {},
             "status": "infeasible",
@@ -404,9 +581,26 @@ def run_sweep_line(n0: pypsa.Network, args, devnet_name: str, file_prefix: str =
         lmp_spread = np.nan
         max_loading_pu = np.nan
 
-        apply_load_multipliers(n, parse_json_dict(args.k_load))
-        apply_corridor_reducers(n, {line: float(k)})
-        apply_gen_marginal_cost_by_bus(n, parse_json_dict(args.mc_bus), mode=args.mc_mode)
+        apply_load_multipliers(
+            n,
+            parse_json_dict(args.k_load),
+        )
+
+        apply_corridor_reducers(
+            n,
+            parse_json_dict(args.k_line),
+        )
+
+        apply_gen_capacity_multipliers(
+            n,
+            parse_json_dict(args.k_gen),
+        )
+
+        apply_gen_marginal_cost_by_bus(
+            n,
+            parse_json_dict(args.mc_bus),
+            mode=args.mc_mode,
+        )
 
         if devnet_name == "devnetDC-sld" and "Load_DC_PJM_NE" in n.loads.index:
             byog_p = float(n.loads.at["Load_DC_PJM_NE", "byog_p_nom"])
@@ -496,14 +690,23 @@ def run_sweep_line(n0: pypsa.Network, args, devnet_name: str, file_prefix: str =
 # - congestion indicators
 # Used for console output and HTML reporting
 # ------------------------------------------------------------------------------
-def _dashboard_from_single(res: dict) -> dict:
-    obj = float(res.get("objective", np.nan))
+def _dashboard_from_single(
+    res: dict,
+    report_bus: str = "PJM_NE",
+    ) -> dict:
 
+    obj = float(res.get("objective", np.nan))
     lmp = res.get("lmp", {}) or {}
     lmp_vals = np.array(list(lmp.values()), dtype=float) if len(lmp) else np.array([])
     lmp_spread = float(np.nanmax(lmp_vals) - np.nanmin(lmp_vals)) if lmp_vals.size else np.nan
     max_lmp_bus = max(lmp, key=lambda b: float(lmp[b])) if len(lmp) else ""
     max_lmp = float(lmp[max_lmp_bus]) if max_lmp_bus else np.nan
+    reported_lmp = float(
+        lmp.get(
+            report_bus,
+            np.nan,
+        )
+    )
 
     loading = res.get("line_loading_pu", {}) or {}
     loading_vals = np.array(list(loading.values()), dtype=float) if len(loading) else np.array([])
@@ -522,18 +725,34 @@ def _dashboard_from_single(res: dict) -> dict:
         )
     )
 
+    total_system_load_mw = float(
+        res.get("total_system_load_mw", np.nan)
+    )
+
+    generator_dispatch_mw = (
+        res.get("generator_dispatch_mw", {}) or {}
+    )
+
+    bus_net_import_mw = (
+        res.get("bus_net_import_mw", {}) or {}
+    )
+
     return {
         "objective": obj,
+        "total_system_load_mw": total_system_load_mw,
+        "generator_dispatch_mw": generator_dispatch_mw,
+        "bus_net_import_mw": bus_net_import_mw,
         "lmp_spread": lmp_spread,
         "max_lmp_bus": max_lmp_bus,
         "max_lmp": max_lmp,
+        "report_bus": report_bus,
+        "reported_lmp": reported_lmp,
         "max_loading_pu": max_loading_pu,
         "max_loading_line": max_loading_line,
         "near_bind_ct": near_bind_ct,
         "dc_dispatch_mw": dc_dispatch_mw,
         "top_lines": top_lines,
     }
-
 
 def _dashboard_from_sweep(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
@@ -587,13 +806,56 @@ def dashboard_text(args, mode: str, dash: dict, devnet: pypsa.Network) -> str:
 
     lines.append(
         f"args: scenario={args.scenario}  mc_mode={args.mc_mode}  line={args.line or '-'}  "
-        f"k_load={args.k_load}  k_line={args.k_line}  mc_bus={args.mc_bus}  "
+        f"k_load={args.k_load}  k_line={args.k_line}  "
+        f"k_gen={args.k_gen}  mc_bus={args.mc_bus}  "
+        f"lmp_bus={getattr(args, 'lmp_bus', 'PJM_NE')}  "        
         f"byog_mc={dc_mc_str}  dc_p_set={dc_p_set_str}  dc_p_nom={dc_p_nom_str}"
     )
 
     if args.scenario in ("baseline", "single"):
         lines.append(f"objective        : {dash['objective']:.3e}")
-        lines.append(f"lmp_spread       : {dash['lmp_spread']:.3f}   max_lmp: {dash['max_lmp']:.3f} @ {dash['max_lmp_bus']}")
+        lines.append(
+            f"total_load_mw     : "
+            f"{dash['total_system_load_mw']:,.1f}"
+        )
+
+        generator_dispatch = (
+            dash.get("generator_dispatch_mw", {}) or {}
+        )
+
+        if generator_dispatch:
+            lines.append("generator_dispatch_mw:")
+
+            for generator, dispatch in generator_dispatch.items():
+                lines.append(
+                    f"  {generator:24s}: {float(dispatch):10,.1f}"
+                )
+
+        bus_net_import = (
+            dash.get("bus_net_import_mw", {}) or {}
+        )
+
+        if bus_net_import:
+            lines.append(
+                "bus_import_export_mw "
+                "(+IMPORT / -EXPORT):"
+            )
+
+            for bus, value in bus_net_import.items():
+                lines.append(
+                    f"  {bus:24s}: {float(value):10,.1f}"
+                )
+        lines.append(
+            f"{dash['report_bus']}_lmp".ljust(18)
+            + f": {dash['reported_lmp']:.3f}"
+        )
+
+        lines.append(
+            f"lmp_spread       : {dash['lmp_spread']:.3f}   "
+            f"max_lmp: {dash['max_lmp']:.3f} @ "
+            f"{dash['max_lmp_bus']}"
+        )
+
         lines.append(f"max_loading_pu   : {dash['max_loading_pu']:.3f} @ {dash['max_loading_line']}")
         lines.append(f"near_bind_ct(>=.95): {dash['near_bind_ct']}")
         if dash.get("top_lines"):
@@ -689,7 +951,7 @@ def build_sanity_panel_lines(devnet: pypsa.Network) -> list[str]:
     lines = []
     lines.append("")
     lines.append("DevNet base params:")
-    lines.append(f"  Buses_N            = {base['buses_n']}")
+    lines.append(f"  Buses       = {base['buses_n']}")
 
     dc_mc = None
     if "byog_mc" in devnet.loads.columns:
@@ -711,25 +973,26 @@ def build_sanity_panel_lines(devnet: pypsa.Network) -> list[str]:
             pass
 
     if dc_p_set is not None and dc_p_nom is not None:
-        lines.append(f"  dc_p_set (MW)        = {dc_p_set:.1f}")
-        lines.append(f"  dc_p_nom (MW)        = {dc_p_nom:.1f}")
+        lines.append(f"  DC load MW  = {dc_p_set:.1f}")
+        lines.append(f"  DC BYOG MW  = {dc_p_nom:.1f}")
+        
     else:
-        lines.append(f"  dc_p_set / p_nom     = n/a")
+        lines.append("  DC load/BYOG = n/a")
 
     if dc_mc is not None:
-        lines.append(f"  dc_byog_mc (USD/MWh) = {dc_mc:.2f} [loads.csv]")
+        lines.append(f"  DC MC $/MWh = {dc_mc:.2f}")
     else:
-        lines.append(f"  dc_byog_mc (USD/MWh) = n/a")
+        lines.append("  DC MC $/MWh = n/a")
 
     if not np.isnan(base["mc_repr"]):
-        lines.append(f"  c_g (USD/MWh)      = {base['mc_repr']:.2f} {base['mc_note']}".rstrip())
+        lines.append(f"  Min MC $/MWh = {base['mc_repr']:.2f}")
     else:
-        lines.append(f"  c_g (USD/MWh)      = (missing) {base['mc_note']}".rstrip())
+        lines.append("  Min MC $/MWh = n/a")
 
     if not np.isnan(base["s_nom_repr"]):
-        lines.append(f"  line s_nom (MW)    = {base['s_nom_repr']:.1f} {base['s_nom_note']}".rstrip())
+        lines.append(f"  Line MW     = {base['s_nom_repr']:.1f}")
     else:
-        lines.append(f"  line s_nom (MW)    = (missing) {base['s_nom_note']}".rstrip())
+        lines.append("  Line MW     = n/a")
 
     lines.append("")
     lines.append("System-wide adequacy check:")
@@ -741,19 +1004,51 @@ def build_sanity_panel_lines(devnet: pypsa.Network) -> list[str]:
     lines.append("  surplus = Σ p_nom(gen@bus) - Σ p_set(load@bus)")
     lines.append("")
 
-    gen_by_bus = devnet.generators.groupby("bus")["p_nom"].sum() if len(devnet.generators) else None
-    load_by_bus = devnet.loads.groupby("bus")["p_set"].sum() if len(devnet.loads) else None
+    gen_by_bus = (
+        devnet.generators.groupby("bus")["p_nom"].sum()
+        if len(devnet.generators)
+        else None
+    )
+
+    load_by_bus = (
+        devnet.loads.groupby("bus")["p_set"].sum()
+        if len(devnet.loads)
+        else None
+    )
+
+    mc_by_bus = (
+        devnet.generators.groupby("bus")["marginal_cost"].min()
+        if len(devnet.generators)
+        else None
+    )
 
     rows = []
+
     for b in devnet.buses.index:
         g = float(gen_by_bus.get(b, 0.0)) if gen_by_bus is not None else 0.0
         l = float(load_by_bus.get(b, 0.0)) if load_by_bus is not None else 0.0
-        rows.append((b, g, l, g - l))
+        mc = float(mc_by_bus.get(b, np.nan)) if mc_by_bus is not None else np.nan
 
-    lines.append("              gen     load   surplus")
-    for b, g, l, s in sorted(rows, key=lambda x: x[3]):
-        status = "EXPORT" if s > 0 else ("BAL" if s == 0 else "IMPORT")
-        lines.append(f"  {b:8s}    {g:7.1f}  {l:7.1f}  {s:7.1f}  [{status}]")
+        rows.append(
+            (
+                b,
+                g,
+                l,
+                mc,
+                g - l,
+            )
+        )
+
+    lines.append("  bus          gen    load     MC   surplus")
+
+    for b, g, l, mc, s in sorted(rows, key=lambda x: x[4]):
+        status = "EXP" if s > 0 else ("BAL" if s == 0 else "IMP")
+        mc_txt = f"{mc:5.1f}" if not np.isnan(mc) else "  n/a"
+
+        lines.append(
+            f"  {b:8s} {g:7.0f} {l:7.0f} "
+            f"{mc_txt} {s:8.0f} [{status}]"
+        )
 
     return lines
 
@@ -1106,7 +1401,14 @@ def run_commit(
 
     if args.scenario in ("baseline", "single"):
         res = run_single(devnet, args, tag=f"{prefix}{args.scenario}", devnet_name=devnet_name)
-        dash = _dashboard_from_single(res)
+        dash = _dashboard_from_single(
+            res,
+            report_bus=getattr(
+                args,
+                "lmp_bus",
+                "PJM_NE",
+            ),
+        )
         kind = "single"
     else:
         df = run_sweep_line(devnet, args, devnet_name=devnet_name, file_prefix=prefix)

@@ -1,0 +1,7 @@
+name,bus,p_nom,carrier,marginal_cost
+Gen_WECC_NW,WECC_NW,5000.0,gas,40.0
+Gen_WECC_SW,WECC_SW,5000.0,gas,45.0
+Gen_SPP_MISO,SPP_MISO,5000.0,gas,50.0
+Gen_PJM_NE,PJM_NE,5000.0,gas,60.0
+Gen_SERC_SE,SERC_SE,6000.0,gas,55.0
+Gen_ERCOT,ERCOT,5000.0,gas,50.0

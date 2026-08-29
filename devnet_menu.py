@@ -52,14 +52,31 @@ from datetime import datetime
 
 SECTION_SEPARATOR = "=" * 80
 
+# ------------------------------------------------------------------------------
+# script_path()
+# Returns the absolute path to a DevNet script located alongside devnet_menu.py.
+#
+# Ensures:
+# - Menu-launched scripts resolve independent of the current working directory.
+# - All DevNet workflow scripts are launched from a consistent base path.
+# ------------------------------------------------------------------------------
 def script_path(name: str) -> str:
     """Return absolute path to a sibling script in the same folder as this file."""
     base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, name)
 
+# ------------------------------------------------------------------------------
+# run_script()
+# Launches the selected DevNet workflow script using the current Python
+# interpreter and returns its process exit code.
+#
+# CTRL-C terminates the active child process cleanly and propagates the
+# interrupt to devnet_menu.py for graceful workflow termination.
+# ------------------------------------------------------------------------------
 def run_script(script_name: str) -> int:
-    """Run a python script as a subprocess using the current interpreter."""
+    """Run a Python script as a subprocess using the current interpreter."""
     path = script_path(script_name)
+
     if not os.path.exists(path):
         print(f"\nERROR: Cannot find {script_name} at:\n  {path}\n")
         return 1
@@ -69,15 +86,56 @@ def run_script(script_name: str) -> int:
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{SECTION_SEPARATOR}\n")
 
-    # Run with the same Python interpreter that's running the menu.
-    # This preserves your current environment (PyPSA, matplotlib, etc.)
-    print("Tip: Run devnet_cfg.py first to create/edit CSV inputs. Run devnet_stress.py before plot scripts.\n")
-    result = subprocess.run([sys.executable, path])
-    return result.returncode
+    print(
+        "Tip: Run devnet_cfg.py first to create/edit CSV inputs. "
+        "Run devnet_stress.py before plot scripts.\n"
+    )
 
+    # ------------------------------------------------------------------
+    # Run child script in its own process group.
+    #
+    # This keeps CTRL-C handling with devnet_menu.py so the active child
+    # process can be terminated cleanly without a Python traceback dump.
+    # ------------------------------------------------------------------
+    popen_kwargs = {}
+
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(
+        [sys.executable, path],
+        **popen_kwargs,
+    )
+
+    try:
+        return process.wait()
+
+    except KeyboardInterrupt:
+
+        if process.poll() is None:
+            process.terminate()
+
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+        raise
+
+# ------------------------------------------------------------------------------
+# clear_console()
+# Clears the terminal before redisplaying the DevNet workflow menu.
+# ------------------------------------------------------------------------------
 def clear_console():
     os.system("cls" if os.name == "nt" else "clear")
 
+# ------------------------------------------------------------------------------
+# print_header()
+# Displays the DevNet workflow description, execution sequence, and usage notes.
+# ------------------------------------------------------------------------------
 def print_header():
     print(SECTION_SEPARATOR)
     print("DeltaE / PhD – Datacenter BYOG DoE Workflow (PyPSA)")
@@ -125,6 +183,10 @@ def print_header():
         "\n(Analysis module will be added later.)\n"
     )
 
+# ------------------------------------------------------------------------------
+# print_menu()
+# Displays the available DevNet build, stress-test, and plotting operations.
+# ------------------------------------------------------------------------------
 def print_menu():
     print("Select an option:")
     print("  1) Generate DevNet CSV templates (devnet_cfg.py)")
@@ -135,8 +197,18 @@ def print_menu():
     print("  6) Plot: Load vs system metrics (devnet_load_plot.py)")
     print("  7) Plot: MC table + LMP spread heatmap + metrics panel (devnet_lmp_plot.py)")
     print("  8) Plot: Line deration vs system metrics (devnet_line_plot.py)")
+    print("  9) Plot: DevNet 8760 objective/load/feasibility (devnet_sys_plot.py)")
+    print(" 10) Plot: PJM_NE 8760 LMP chronology (devnet_pjm_ne_lmp_plot.py)")
+    print(" 11) Plot: Journal publication figures (devnet_pub_figs.py)")
     print("  0) Exit")
 
+# ------------------------------------------------------------------------------
+# main()
+# Runs the interactive DevNet workflow menu and dispatches the selected script.
+#
+# Continues returning to the menu after each completed operation until the user
+# explicitly exits or terminates the workflow with CTRL-C.
+# ------------------------------------------------------------------------------
 def main():
     while True:
         clear_console()
@@ -169,6 +241,15 @@ def main():
         elif choice == "8":
             rc = run_script("devnet_line_plot.py")
             input(f"\nFinished devnet_line_plot.py (exit code {rc}). Press Enter to return to menu...")
+        elif choice == "9":
+            rc = run_script("devnet_sys_plot.py")
+            input(f"\nFinished devnet_sys_plot.py (exit code {rc}). Press Enter to return to menu...")
+        elif choice == "10":
+            rc = run_script("devnet_pjm_ne_lmp_plot.py")
+            input(f"\nFinished devnet_pjm_ne_lmp_plot.py (exit code {rc}). Press Enter to return to menu...")
+        elif choice == "11":
+            rc = run_script("devnet_pub_figs.py")
+            input(f"\nFinished devnet_pub_figs.py (exit code {rc}). Press Enter to return to menu...")
         elif choice == "0":
             print("\nExiting devnet_menu.py\n")
             return 0
@@ -176,5 +257,13 @@ def main():
             input("\nInvalid choice. Press Enter to try again...")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-# End of devnet_menu.py
+    try:
+        raise SystemExit(main())
+
+    except KeyboardInterrupt:
+        print("\n\nUser terminated. Exiting DevNet workflow.\n")
+        raise SystemExit(130)
+    
+# ------------------------------------------------------------------------------
+# END OF devnet_menu.py
+# ------------------------------------------------------------------------------

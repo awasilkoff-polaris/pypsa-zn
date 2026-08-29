@@ -1,0 +1,7 @@
+name,v_nom,type,x,y,carrier,unit,location,control,generator,sub_network
+WECC_NW,345.0,,10.0,0.0,ac,,,PQ,,
+WECC_SW,345.0,,5.0,-8.66,ac,,,PQ,,
+SPP_MISO,345.0,,-5.0,-8.66,ac,,,PQ,,
+PJM_NE,345.0,,-10.0,0.0,ac,,,PQ,,
+SERC_SE,345.0,,-5.0,8.66,ac,,,PQ,,
+ERCOT,345.0,,5.0,8.66,ac,,,PQ,,

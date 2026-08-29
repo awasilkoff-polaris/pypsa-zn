@@ -1,0 +1,7 @@
+bus,x,y,v_nom,carrier
+WECC_NW,10.0,0.0,345,ac
+WECC_SW,5.0,-8.66,345,ac
+SPP_MISO,-5.0,-8.66,345,ac
+PJM_NE,-10.0,0.0,345,ac
+SERC_SE,-5.0,8.66,345,ac
+ERCOT,5.0,8.66,345,ac

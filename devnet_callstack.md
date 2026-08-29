@@ -1,6 +1,6 @@
 ```text
 SPDX-License-Identifier: Apache-2.0
-Copyright 2025 ZeroNode
+Copyright 2026 ZeroNode
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -14,99 +14,131 @@ devnet_callstack.md
 ------------------------------------------------------------------------------
 ```
 
-# devnet call stack
-Call trace of the devnet network modelling and analysis stack
+# DevNet Call Stack
+
+Call trace of the DevNet network modelling, stress-analysis and reporting stack.
+
+The workflow is split between:
+
+- `devnet_stress.py` — interactive researcher shell and menu workflow.
+- `lib/devnet_stress_lib.py` — non-interactive OPF execution, stress logic, result collection, dashboards and HTML reporting.
 
 ---
 
 # Table of Contents
-- [devnet call stack](#devnet-call-stack)
+- [DevNet Call Stack](#devnet-call-stack)
 - [Table of Contents](#table-of-contents)
-- [devnet call stack](#devnet-call-stack-1)
-  - [devnet\_stress.py function list](#devnet_stresspy-function-list)
+  - [`devnet_stress.py` — interactive shell functions](#devnet_stresspy--interactive-shell-functions)
+  - [`lib/devnet_stress_lib.py` — stress engine functions](#libdevnet_stress_libpy--stress-engine-functions)
+    - [OPF / stress execution](#opf--stress-execution)
+    - [Results / dashboards](#results--dashboards)
+    - [Preview / commit / reporting](#preview--commit--reporting)
   - [devnet\_stress.py call stack map](#devnet_stresspy-call-stack-map)
     - [Entry branch: `main()`](#entry-branch-main)
-    - [Interactive branch: `researcher_loop()` (R/C/Q loop)](#interactive-branch-researcher_loop-rcq-loop)
+    - [Interactive branch: `researcher_loop()` — R / C / Q loop](#interactive-branch-researcher_loop--r--c--q-loop)
     - [Commit branch: `researcher_loop()` when user selects `C`](#commit-branch-researcher_loop-when-user-selects-c)
-    - [HTML/reporting branch: `update_index_html(outdir, devnet)`](#htmlreporting-branch-update_index_htmloutdir-devnet)
+    - [HTML/reporting branch: `dsl.update_index_html(...)`](#htmlreporting-branch-dslupdate_index_html)
     - [Lower-level compute primitives](#lower-level-compute-primitives)
+  - [Deferred / Future Work](#deferred--future-work)
+    - [`sweep_line` Workflow](#sweep_line-workflow)
 - [Reference](#reference)
 
 ---
 
-# devnet call stack
-Call trace of the devnet network modelling and analysis stack
+## `devnet_stress.py` — interactive shell functions
 
-## devnet_stress.py function list
+- `confirm(...)`
+- `build_argparser(...)`
+- `build_args_catalog(...)`
+- `capture_catalog_lines(...)`
+- `print_two_columns(...)`
+- `prompt_custom_k_load(...)`
+- `prompt_custom_k_line(...)`
+- `prompt_custom_k_gen(...)`
+- `prompt_custom_mc_bus(...)`
+- `_pick_from_menu(...)`
+- `configure_args_menu(...)`
+- `print_dashboard(...)`
+- `researcher_loop(...)`
+- `main()`
 
-- def confirm(prompt)
-- def solve_with_duals(...)
-- def apply_load_multipliers(...)
-- def apply_corridor_reducers(...)
-- def apply_gen_marginal_cost_by_bus(...)
-- def resolve_dc_csv_values(...)
-- def collect_results(...)
-- def write_outputs(...)
-- def parse_json_dict(...)
-- def resolve_byog_mc(...)
-- def run_single(...)
-- def run_sweep_line(...)
-- def build_argparser(...)
-- def build_args_catalog(...)
-- def capture_catalog_lines(...)
-- def print_two_columns(...)
-- def prompt_custom_k_load(...)
-- def prompt_custom_k_line(...)
-- def prompt_custom_mc_bus(...)
-- def _pick_from_menu(...)
-- def configure_args_menu(...)
-- def _dashboard_from_single(...)
-- def _dashboard_from_sweep(...)
-- def dashboard_text(...)
-- def devnet_base_params(...)
-- def build_sanity_panel_lines(...)
-- def write_commit_dashboard_md(...)
-- def update_index_html(...)
-- def print_dashboard(...)
-- def run_preview(...)
-- def _next_commit_id(...)
-- def researcher_loop(...)
-- def main()
+## `lib/devnet_stress_lib.py` — stress engine functions
+
+### OPF / stress execution
+
+- `solve_with_duals(...)`
+- `apply_load_multipliers(...)`
+- `apply_corridor_reducers(...)`
+- `apply_gen_capacity_multipliers(...)`
+- `apply_gen_marginal_cost_by_bus(...)`
+- `resolve_dc_csv_values(...)`
+- `resolve_byog_mc(...)`
+- `parse_json_dict(...)`
+- `run_single(...)`
+- `run_sweep_line(...)`
+
+### Results / dashboards
+
+- `collect_results(...)`
+- `write_outputs(...)`
+- `_dashboard_from_single(...)`
+- `_dashboard_from_sweep(...)`
+- `dashboard_text(...)`
+- `devnet_base_params(...)`
+- `build_sanity_panel_lines(...)`
+
+### Preview / commit / reporting
+
+- `run_preview(...)`
+- `_next_commit_id(...)`
+- `run_commit(...)`
+- `write_commit_dashboard_md(...)`
+- `update_index_html(...)`
 
 ---
 
 ## devnet_stress.py call stack map
 
 ### Entry branch: `main()`
+
 main()
 ├─ build_argparser(DEVNET_BLD_PATH)
-│  └─ (argparse .parse_args() in main)
+│  └─ argparse.parse_args()
 ├─ build_args_catalog(devnet)
-│  └─ resolve_dc_csv_values(devnet)
+│  └─ dsl.resolve_dc_csv_values(devnet)
 ├─ capture_catalog_lines(catalog)
-├─ build_sanity_panel_lines(devnet)
-│  └─ devnet_base_params(devnet)
+├─ dsl.build_sanity_panel_lines(devnet)
+│  └─ dsl.devnet_base_params(devnet)
 ├─ print_two_columns(left, right, ...)
-├─ update_index_html(args.outdir, devnet)      # initial HTML bootstrap
+├─ dsl.update_index_html(
+│      args.outdir,
+│      devnet,
+│      DEVNET_NAME
+│  )
 └─ researcher_loop(devnet, args, catalog)
 
 ---
 
-### Interactive branch: `researcher_loop()` (R/C/Q loop)
+### Interactive branch: `researcher_loop()` — R / C / Q loop
+
 researcher_loop(devnet, args, catalog)
+│
 ├─ configure_args_menu(devnet, args)
 │  ├─ build_args_catalog(devnet)
-│  │  └─ resolve_dc_csv_values(devnet)
-│  ├─ _pick_from_menu(title, options, default_idx)
-│  ├─ prompt_custom_k_load(devnet)             # when k_load == "__CUSTOM__"
-│  ├─ prompt_custom_k_line(devnet)             # when k_line == "__CUSTOM__"
-│  ├─ prompt_custom_mc_bus(devnet)             # when mc_bus == "__CUSTOM__"
-│  └─ sets:
+│  │  └─ dsl.resolve_dc_csv_values(devnet)
+│  ├─ _pick_from_menu(...)
+│  ├─ prompt_custom_k_load(...)       # optional
+│  ├─ prompt_custom_k_line(...)       # optional
+│  ├─ prompt_custom_k_gen(...)        # optional
+│  ├─ prompt_custom_mc_bus(...)       # optional
+│  └─ configures:
 │     ├─ scenario
 │     ├─ mc_mode
 │     ├─ k_load
 │     ├─ k_line
+│     ├─ k_gen
 │     ├─ mc_bus
+│     ├─ lmp_bus
 │     ├─ byog_mc
 │     ├─ dc_p_set
 │     ├─ dc_p_nom
@@ -115,104 +147,154 @@ researcher_loop(devnet, args, catalog)
 │     ├─ kmax
 │     └─ kstep
 │
-├─ run_preview(devnet, args)
-│  ├─ run_single(devnet, args, tag="preview_*")         # baseline/single
-│  │  ├─ parse_json_dict(args.k_load)
-│  │  ├─ parse_json_dict(args.k_line)
-│  │  ├─ parse_json_dict(args.mc_bus)
-│  │  ├─ apply_load_multipliers(n, k_load_dict)
-│  │  ├─ apply_corridor_reducers(n, k_line_dict)
-│  │  ├─ apply_gen_marginal_cost_by_bus(n, mc_bus_dict, mode=args.mc_mode)
-│  │  ├─ resolve_byog_mc(n, args)                       # devnetDC-sld only
-│  │  ├─ solve_with_duals(n, solver=args.solver)
-│  │  ├─ collect_results(n)
-│  │  └─ write_outputs(Path(args.outdir), tag, results)
-│  │
-│  └─ run_sweep_line(devnet, args, file_prefix="")      # sweep_line
-│     ├─ loop over k values
-│     ├─ apply_load_multipliers(..., parse_json_dict(args.k_load))
-│     ├─ apply_corridor_reducers(..., {args.line: k})
-│     ├─ apply_gen_marginal_cost_by_bus(..., parse_json_dict(args.mc_bus), mode=args.mc_mode)
-│     ├─ resolve_byog_mc(n, args)                       # devnetDC-sld only
-│     ├─ solve_with_duals(...)
-│     ├─ collect_results(...)
-│     └─ write sweep_line_summary.csv
+├─ dsl.run_preview(devnet, args, DEVNET_NAME)
 │
-├─ _dashboard_from_single(res)              # when preview kind == single
-├─ _dashboard_from_sweep(df)                # when preview kind == sweep
-└─ print_dashboard(args, mode="PREVIEW", dash)
-   └─ dashboard_text(args, mode, dash)
-      └─ resolve_dc_csv_values(devnet)
-
+│  ├─ baseline / single
+│  │   └─ dsl.run_single(...)
+│  │       ├─ apply_load_multipliers(...)
+│  │       ├─ apply_corridor_reducers(...)
+│  │       ├─ apply_gen_capacity_multipliers(...)
+│  │       ├─ apply_gen_marginal_cost_by_bus(...)
+│  │       ├─ optional DC load/BYOG overrides
+│  │       ├─ optional `Gen_DC_PJM_NE`
+│  │       ├─ solve_with_duals(...)
+│  │       ├─ collect_results(...)
+│  │       └─ write_outputs(...)
+│  │
+│  └─ sweep_line
+│      └─ dsl.run_sweep_line(...)
+│
+├─ dsl._dashboard_from_single(
+│      res,
+│      report_bus=args.lmp_bus
+│  )
+│      OR
+│  dsl._dashboard_from_sweep(df)
+│
+└─ print_dashboard(...)
+   └─ dsl.dashboard_text(...)
+   
 ---
 
 ### Commit branch: `researcher_loop()` when user selects `C`
-researcher_loop(...)  [cmd == "c"]
-├─ _next_commit_id(outdir)
-├─ run_single(..., tag=f"cN_{scenario}")   OR   run_sweep_line(..., file_prefix="cN_")
-│  └─ (same compute chain as preview)
-├─ _dashboard_from_single(...)             OR   _dashboard_from_sweep(...)
-├─ print_dashboard(args, mode=f"COMMIT::cN", dash)
-│  └─ dashboard_text(args, mode, dash)
-├─ write_commit_dashboard_md(outdir, commit_id, dash_txt)
-├─ update_index_html(args.outdir, devnet)
-└─ Refresh UX after commit:
+
+researcher_loop(...) [cmd == "c"]
+│
+├─ dsl.run_commit(
+│      devnet,
+│      args,
+│      DEVNET_NAME
+│  )
+│
+│  ├─ _next_commit_id(args.outdir)
+│  │
+│  ├─ run_single(...)
+│  │      OR
+│  │  run_sweep_line(...)
+│  │
+│  ├─ _dashboard_from_single(
+│  │      res,
+│  │      report_bus=args.lmp_bus
+│  │  )
+│  │      OR
+│  │  _dashboard_from_sweep(df)
+│  │
+│  ├─ dashboard_text(...)
+│  ├─ write_commit_dashboard_md(...)
+│  └─ update_index_html(
+│         args.outdir,
+│         devnet,
+│         DEVNET_NAME
+│     )
+│
+├─ prints committed dashboard / Commit ID / index.html path
+│
+└─ refreshes researcher display:
    ├─ build_args_catalog(devnet)
-   │  └─ resolve_dc_csv_values(devnet)
    ├─ capture_catalog_lines(catalog)
-   ├─ build_sanity_panel_lines(devnet)
-   │  └─ devnet_base_params(devnet)
-   └─ print_two_columns(left, right, ...)
+   ├─ dsl.build_sanity_panel_lines(devnet)
+   └─ print_two_columns(...)
 
 ---
 
-### HTML/reporting branch: `update_index_html(outdir, devnet)`
-update_index_html(outdir, devnet)
-├─ scans stress_out/ for commit artifacts: cN_*.csv, cN_dashboard.md
-├─ (internal) _read_commit_metrics(cN)
-└─ generates index.html
-   ├─ embeds Commit Summary table
-   ├─ embeds per-commit dashboards (from cN_dashboard.md)
-   ├─ lists per-commit CSV artifacts
-   └─ embeds right panel:
-      ├─ SLD image:
-      │  ├─ ../plots/devnetDC-sld.png   # if DEVNET_NAME == "devnetDC-sld"
-      │  └─ ../plots/devnet.png         # otherwise
-      └─ sanity panel text from build_sanity_panel_lines(devnet)
+### HTML/reporting branch: `dsl.update_index_html(...)`
 
+update_index_html(
+    outdir,
+    devnet,
+    devnet_name,
+    use_http_paths=False
+)
+│
+├─ scans stress_out/ for:
+│  ├─ cN_dashboard.md
+│  └─ cN_*.csv
+│
+├─ reads commit summary metrics
+│
+├─ loads:
+│  └─ lib/devnet_stress_frame.html
+│
+└─ generates stress_out/index.html
+   ├─ Commit Summary table
+   ├─ per-commit dashboard cards
+   ├─ links to generated CSV artifacts
+   ├─ DevNet SLD image
+   └─ sanity / base-parameter panel
+   
 ---
 
 ### Lower-level compute primitives
 
 solve_with_duals(n, solver)
-└─ n.optimize(solver_name=solver, assign_all_duals=True)
+└─ n.optimize(
+     solver_name=solver,
+     assign_all_duals=True
+   )
 
-apply_load_multipliers(n, k_load_dict)
-apply_corridor_reducers(n, k_line_dict)
-apply_gen_marginal_cost_by_bus(n, mc_bus_dict, mode)
-resolve_dc_csv_values(devnet)
-collect_results(n)
-write_outputs(outdir, tag, results)
-parse_json_dict(s)
-resolve_byog_mc(n, args)
+apply_load_multipliers(n, k_load)
+└─ applies regional load stress
+   └─ explicit DC loads are excluded
 
-run_single(n0, args, tag)
-└─ deepcopy(n0)
-   ├─ apply_load_multipliers
-   ├─ apply_corridor_reducers
-   ├─ apply_gen_marginal_cost_by_bus
-   ├─ optional DC BYOG generator add (devnetDC-sld only)
-   ├─ solve_with_duals
-   ├─ collect_results
-   └─ write_outputs
+apply_corridor_reducers(n, k_line)
+└─ scales line s_nom
 
-run_sweep_line(n0, args, file_prefix)
-└─ loops k_line values
-   ├─ apply_*
-   ├─ optional DC BYOG generator add (devnetDC-sld only)
-   ├─ solve_with_duals
-   ├─ collect_results
-   └─ writes sweep_line_summary.csv
+apply_gen_capacity_multipliers(n, k_gen)
+└─ scales generation p_nom by bus
+   ├─ 1.0 = unchanged
+   ├─ 0.5 = 50% derating
+   └─ 0.0 = outage
+
+apply_gen_marginal_cost_by_bus(n, mc_bus, mode)
+└─ changes generation marginal cost by bus
+
+run_single(...)
+├─ deepcopy(base network)
+├─ apply stress parameters
+├─ apply optional DC p_set / BYOG p_nom / BYOG MC
+├─ add `Gen_DC_PJM_NE` for devnetDC-sld
+├─ solve OPF
+├─ collect:
+│  ├─ objective
+│  ├─ total system load
+│  ├─ generator dispatch
+│  ├─ bus import/export
+│  ├─ LMP
+│  └─ line loading
+└─ write result artifacts
+
+collect_results(...)
+└─ bus_net_import_mw sign convention:
+   ├─ positive = IMPORT
+   └─ negative = EXPORT
+   
+---
+
+## Deferred / Future Work
+
+### `sweep_line` Workflow
+
+`sweep_line` is currently unused by the validated Datacenter BYOG experiments. A sanity check identified that the sweep variable requires future review before this path is treated as a supported research workflow. See local TODO for the point fix and menu/argument-display cleanup.
 
 ---
 

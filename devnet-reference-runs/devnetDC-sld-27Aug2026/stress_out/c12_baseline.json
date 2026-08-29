@@ -1,0 +1,39 @@
+{
+  "snapshot": "now",
+  "objective": 1586666.6666666667,
+  "total_system_load_mw": 32000.0,
+  "generator_dispatch_mw": {
+    "Gen_WECC_NW": 5000.0,
+    "Gen_WECC_SW": 5000.0,
+    "Gen_SPP_MISO": 5000.0,
+    "Gen_PJM_NE": 3333.333333333333,
+    "Gen_SERC_SE": 5666.666666666667,
+    "Gen_ERCOT": 5000.0,
+    "Gen_DC_PJM_NE": 3000.0
+  },
+  "bus_net_import_mw": {
+    "WECC_NW": 0.0,
+    "WECC_SW": 0.0,
+    "SPP_MISO": 0.0,
+    "PJM_NE": 666.666666666667,
+    "SERC_SE": -666.666666666667,
+    "ERCOT": 0.0
+  },
+  "dc_dispatch_mw": 3000.0,
+  "lmp": {
+    "WECC_NW": 58.333333333333336,
+    "WECC_SW": 58.333333333333336,
+    "SPP_MISO": 58.333333333333336,
+    "PJM_NE": 60.0,
+    "SERC_SE": 55.0,
+    "ERCOT": 56.666666666666664
+  },
+  "line_loading_pu": {
+    "L_WECC_NW_WECC_SW": 0.0,
+    "L_WECC_SW_SPP_MISO": 0.0,
+    "L_SPP_MISO_ERCOT": 0.03333333333333333,
+    "L_SPP_MISO_PJM_NE": 0.03333333333333333,
+    "L_PJM_NE_SERC_SE": 1.0,
+    "L_SERC_SE_ERCOT": 0.03333333333333333
+  }
+}

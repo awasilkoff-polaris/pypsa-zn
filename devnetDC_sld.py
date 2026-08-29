@@ -92,6 +92,58 @@ def next_devnet_name(script_dir: str, base_name: str) -> str:
         i += 1
 
 # ------------------------------------------------------------------------------
+# read_active_config_csv()
+#
+# Reads the active portion of a DevNet configuration CSV.
+#
+# The first row whose first column contains:
+#     # Previous Values
+#
+# marks the end of the active configuration.
+# All subsequent rows are ignored.
+#
+# Used to retain previous experiment values in the same CSV file without
+# affecting the current DevNet build.
+#
+# Ensures:
+# - Only the active configuration is loaded.
+# - Historical parameter sets remain available for reference.
+# - No need to maintain multiple copies of the DevNet configuration CSVs.
+# ------------------------------------------------------------------------------
+def read_active_config_csv(csv_path):
+    """
+    Read only the active section of a DevNet config CSV.
+
+    Any row whose first column contains:
+        # Previous Values
+
+    terminates the active configuration.
+    Everything below that row is ignored.
+    """
+    df = pd.read_csv(csv_path, dtype=str)
+
+    if df.empty:
+        return df
+
+    first_col = df.columns[0]
+
+    marker = (
+        df[first_col]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .eq("# Previous Values")
+    )
+
+    if marker.any():
+        marker_idx = marker[marker].index[0]
+        df = df.loc[: marker_idx - 1]
+
+    df = df.dropna(how="all")
+
+    return df
+
+# ------------------------------------------------------------------------------
 # load_devnet_config()
 # Loads and validates user-configurable DevNet CSV inputs from ./devnet_config:
 #
@@ -136,11 +188,11 @@ def load_devnet_config(config_path: str) -> tuple[pd.DataFrame, pd.DataFrame, pd
             + f"\nRun devnet_cfg.py first, then edit CSVs in:\n{config_path}"
         )
 
-    buses_df = pd.read_csv(os.path.join(config_path, "devnet_buses.csv"))
-    lines_df = pd.read_csv(os.path.join(config_path, "devnet_lines.csv"))
-    assets_df = pd.read_csv(os.path.join(config_path, "devnet_assets.csv"))
-    dc_df = pd.read_csv(os.path.join(config_path, "devnet_dc.csv"))
-    carriers_df = pd.read_csv(os.path.join(config_path, "devnet_carriers.csv"))
+    buses_df = read_active_config_csv(os.path.join(config_path, "devnet_buses.csv"))
+    lines_df = read_active_config_csv(os.path.join(config_path, "devnet_lines.csv"))
+    assets_df = read_active_config_csv(os.path.join(config_path, "devnet_assets.csv"))
+    dc_df = read_active_config_csv(os.path.join(config_path, "devnet_dc.csv"))
+    carriers_df = read_active_config_csv(os.path.join(config_path, "devnet_carriers.csv"))
 
     if len(buses_df) != 6:
         raise ValueError("DevNet release constraint violated: devnet_buses.csv must define exactly 6 bus nodes.")

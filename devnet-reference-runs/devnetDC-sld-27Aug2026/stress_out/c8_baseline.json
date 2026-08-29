@@ -1,0 +1,12 @@
+{
+  "snapshot": "now",
+  "objective": NaN,
+  "total_system_load_mw": 32000.0,
+  "generator_dispatch_mw": {},
+  "bus_net_import_mw": {},
+  "dc_dispatch_mw": NaN,
+  "lmp": {},
+  "line_loading_pu": {},
+  "status": "infeasible",
+  "reason": "Optimization failed or infeasible (objective not numeric)."
+}
