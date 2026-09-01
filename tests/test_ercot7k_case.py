@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -919,3 +920,104 @@ def test_two_k_load_layers_each_declare_the_value_they_replace(
     assert all(r["ScaleFactor"] == "1.400" for r in rows), (
         "the second factor replaces the first; it does not compound")
     assert not ec.has_errors(ec.verify_case(second))
+
+
+# ------------------------------------------------------------------------------
+#   11. ercot7k_build.py -- the operator front end
+#
+#   It cannot be imported: like every other root script it executes at module
+#   level -- banner, log file, Tee over sys.stdout, prompts. So it is exercised
+#   by subprocess with stdin supplied, never by import.
+# ------------------------------------------------------------------------------
+BUILD_SCRIPT = REPO_ROOT / "ercot7k_build.py"
+
+
+def run_build(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(BUILD_SCRIPT), *args],
+        input=stdin, capture_output=True, text=True, cwd=str(REPO_ROOT),
+        timeout=300,
+    )
+
+
+def test_the_front_end_runs_and_prints_its_usage():
+    result = run_build("--help")
+    assert result.returncode == 0, result.stderr
+    assert "--init" in result.stdout
+    assert "--show-config" in result.stdout
+
+
+def test_the_front_end_executes_at_module_level_so_it_is_never_imported():
+    """The banner is printed before any argument is looked at."""
+    result = run_build("--help")
+    assert "ERCOT Texas7k Derived Case Builder" in result.stdout
+
+
+def test_the_front_end_refuses_an_unknown_argument():
+    result = run_build("--sweep")
+    assert result.returncode == 2
+    assert "ASR-ERR" in result.stdout
+
+
+def test_the_front_end_never_dumps_a_traceback_on_a_closed_stdin():
+    """Launched from the menu it is interactive; a closed stdin is not a crash.
+
+    Which ASR-ERR comes back depends on whether the operator has generated
+    ercot7k_config/ yet -- those CSVs are gitignored, so a fresh checkout stops
+    at the missing folder and a working copy stops at the first prompt. Either
+    way it must be a stated reason and an exit code, not a traceback.
+    """
+    result = run_build(stdin="")
+    assert result.returncode == 2
+    assert "ASR-ERR" in result.stdout
+    assert "Traceback" not in result.stderr
+    assert "Traceback" not in result.stdout
+
+
+def test_previous_values_rows_are_ignored(tmp_path: Path):
+    """An operator keeps old parameter sets in the same file, below the marker."""
+    config = tmp_path / "cfg"
+    config.mkdir()
+    (config / "ercot7k_dc.csv").write_text(
+        "dc_name,node,p_set_mw,byog_p_nom_mw,byog_max_mw,byog_mc,load_shape\n"
+        "DC1,N110126,1000,500,500,65,flat\n"
+        "# Previous Values,,,,,,\n"
+        "DCOLD,N110127,4000,4000,4000,99,flat\n",
+        encoding="ascii")
+    (config / "ercot7k_stress.csv").write_text(
+        "lever,target,mode,value\n"
+        "k_load,,scale,1.20\n"
+        "# Previous Values,,,\n"
+        "k_line,,scale,0.90\n",
+        encoding="ascii")
+
+    result = run_build("--show-config", str(config))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ercot7k_dc.csv:: 1 active row(s)" in result.stdout
+    assert "ercot7k_stress.csv:: 1 active row(s)" in result.stdout
+    assert "DC1" in result.stdout
+    assert "DCOLD" not in result.stdout, "rows below the marker are not active"
+    assert "k_line" not in result.stdout, "rows below the marker are not active"
+
+
+def test_the_front_end_reports_a_missing_config_folder(tmp_path: Path):
+    result = run_build("--show-config", str(tmp_path / "absent"))
+    assert result.returncode == 2
+    assert "ASR-ERR" in result.stdout
+
+
+# ------------------------------------------------------------------------------
+#   12. Style: plain ASCII everywhere
+#
+#   The base case is plain ASCII throughout and _serialize_fields() refuses
+#   anything else, so a stray unicode dash in a printed message is a crash
+#   waiting for a cp1252 console rather than a cosmetic issue.
+# ------------------------------------------------------------------------------
+def test_the_new_modules_are_plain_ascii():
+    for name in ("ercot7k_case.py", "ercot7k_build.py",
+                 "tests/test_ercot7k_case.py", "tests/cut_mini7k.py"):
+        data = (REPO_ROOT / name).read_bytes()
+        try:
+            data.decode("ascii")
+        except UnicodeDecodeError as exc:
+            pytest.fail("%s is not plain ASCII: %s" % (name, exc))
