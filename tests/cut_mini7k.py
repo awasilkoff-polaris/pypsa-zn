@@ -89,6 +89,15 @@ WANTED_MONITORED_BRANCHES = 2
 WANTED_UNMONITORED_BRANCHES = 3
 WANTED_INJECTORS = 8
 
+# SCN_INJ_MAX splits the injector set into two populations that the writer
+# treats completely differently: the 167 renewables that already carry
+# availability schedules (ScaleFactor only, never MaxMw) and everything else
+# (append a MaxMw on the default scenario '0'). A fixture holding only one
+# population cannot exercise the rule that separates them, so the cut takes a
+# few of the scheduled injectors ON PURPOSE, in addition to the thermal units
+# the node slice happens to pick up.
+WANTED_SCHEDULED_INJECTORS = 2
+
 
 # ------------------------------------------------------------------------------
 # keep_cycle_rows()
@@ -214,6 +223,27 @@ def select_slice(tables: Dict[str, ec.Table]) -> Dict[str, Set[str]]:
 
     if not injectors:
         raise SystemExit("cut_mini7k: the selected nodes host no injectors")
+
+    # A few injectors that already carry SCN_INJ_MAX availability schedules,
+    # with their nodes dragged in behind them. Taken in file order so the cut
+    # stays deterministic.
+    scheduled: List[str] = []
+    for record in tables["SCN_INJ_MAX"].records():
+        name = record["Injector"]
+        if name in injectors or name in scheduled:
+            continue
+        if name not in injector_nodes:
+            continue
+        scheduled.append(name)
+        if len(scheduled) >= WANTED_SCHEDULED_INJECTORS:
+            break
+    if len(scheduled) < WANTED_SCHEDULED_INJECTORS:
+        raise SystemExit(
+            "cut_mini7k: fewer than %d scheduled injectors found in "
+            "SCN_INJ_MAX" % WANTED_SCHEDULED_INJECTORS)
+    injectors.update(scheduled)
+    nodes.update(injector_nodes[name] for name in scheduled)
+
     return {"nodes": nodes, "injectors": injectors}
 
 
