@@ -29,9 +29,9 @@
 #   replaces sys.stdout. Importing one of those from a test would hang. This
 #   module therefore does NOTHING at import time -- no prints, no prompts, no
 #   directory creation, no logging setup, no sys.stdout replacement. All of the
-#   house-style operator behaviour lives in the front end (ercot7k_build.py,
-#   Milestone 2), which is the only thing ever run from the menu. Read the
-#   quietness here as deliberate, not as an oversight.
+#   house-style operator behaviour lives in the front end (ercot7k_build.py),
+#   which is the only thing ever run from the menu. Read the quietness here as
+#   deliberate, not as an oversight.
 #
 # What it does
 #   - Reads a PSO case directory with byte fidelity. Schema is introspected
@@ -40,8 +40,10 @@
 #     terminator, no BOM, trailing newline, column order, "746.000" stays
 #     "746.000").
 #   - Writes a derived layer: unchanged files copied byte-identically, changed
-#     files appended to, new files created (texas7k_SCN_INJ_DSP.csv and a new
-#     numbered sibling texas7k_SCH_TMP<N>.csv).
+#     files appended to or rewritten row by row (SCN_ARA_LOD for k_load,
+#     SCN_INJ_MAX for per-run capacity), new files created
+#     (texas7k_SCN_INJ_DSP.csv and a new numbered sibling
+#     texas7k_SCH_TMP<N>.csv).
 #   - Writes one pso_case_manifest.json per layer recording what it owns, and
 #     walks the parent chain back to the base, re-hashing every layer so a
 #     hand-edited generated case is a hard error.
@@ -130,22 +132,42 @@ SCN_TABLES: Dict[str, Dict[str, Any]] = {
     },
     "SCN_ARA_LOD": {
         "key_fields": ("Scenario", "Area"),
-        "supported": False,
+        "supported": True,
         "milestone": 2,
+        "op": "read-modify-rewrite",
         "note": (
-            "k_load. Requires read-modify-rewrite of EVERY row and refusal of a "
-            "literal scenario -- a ScaleFactor written only to row '0' leaves "
-            "ScnRT, the reported cycle, at 1.0."
+            "k_load. Read-modify-rewrite of EVERY row, and a literal scenario "
+            "is refused -- a ScaleFactor written only to row '0' leaves ScnRT, "
+            "the reported cycle, at 1.0."
         ),
     },
     "SCN_INJ_MAX": {
         "key_fields": ("Scenario", "Injector"),
-        "supported": False,
+        "supported": True,
         "milestone": 2,
+        "op": "read-merge",
         "note": (
-            "BYOG capacity sweeps. Requires the scheduled-renewable rule: the "
-            "167 injectors that already carry availability schedules may set "
-            "ScaleFactor only, never MaxMw."
+            "BYOG capacity per run, and generator capacity levers. Two disjoint "
+            "populations: injectors that already carry availability schedules "
+            "may set ScaleFactor only, never MaxMw; injectors with no row get "
+            "one appended on the default scenario '0'."
+        ),
+    },
+}
+
+# Stress levers the expander implements. An unrecognised lever is a hard error
+# naming this map, never a skipped row: a silently ignored lever is the exact
+# failure class this component exists to prevent -- the sweep runs, the numbers
+# move a little for unrelated reasons, and the lever was never applied.
+STRESS_LEVERS: Dict[str, Dict[str, Any]] = {
+    "k_load": {
+        "modes": ("scale",),
+        "table": "SCN_ARA_LOD",
+        "targets": "",
+        "note": (
+            "system-wide load scale factor, written to every SCN_ARA_LOD row. "
+            "Per-bus and per-area k_load are out of scope, so target must be "
+            "blank."
         ),
     },
 }
@@ -825,15 +847,20 @@ def datacenter_deltas(spec: DatacenterSpec,
             "AddSchedule delta and the SCH_TMP<N> sibling already exist for "
             "exactly that." % (spec.load_shape,)
         )
-    if float(spec.byog_p_nom_mw) != float(spec.byog_max_mw):
-        raise NotImplementedError(
-            "byog_p_nom_mw (%s) != byog_max_mw (%s). A BYOG whose operating "
-            "capacity differs from its nameplate ceiling needs a SCN_INJ_MAX "
-            "row, and SCN_INJ_MAX is Milestone 2 -- see the SCN_TABLES "
-            "registry in this module. Until it lands INJ_ID.MaxMw alone sets "
-            "BYOG capacity, so the two must be equal or the sweep is silently "
-            "capped at the ceiling (V11)."
-            % (spec.byog_p_nom_mw, spec.byog_max_mw)
+    # byog_max_mw is the STUDY CEILING and goes to INJ_ID.MaxMw; byog_p_nom_mw
+    # is the capacity for THIS run and goes to SCN_INJ_MAX.MaxMw. SCN_INJ_MAX
+    # "identifies more restrictive MaxMw", so it can only restrict, never raise:
+    # a p_nom above the ceiling would be silently capped and every sweep point
+    # past it would report the same number. V11 is the backstop.
+    if float(spec.byog_p_nom_mw) > float(spec.byog_max_mw):
+        raise Ercot7kCaseError(
+            "byog_p_nom_mw (%s) is above byog_max_mw (%s). byog_max_mw is the "
+            "study ceiling written to INJ_ID.MaxMw and byog_p_nom_mw is the "
+            "per-run capacity written to SCN_INJ_MAX.MaxMw, which can only "
+            "restrict that ceiling and never raise it. Raise byog_max_mw to at "
+            "least byog_p_nom_mw, remembering that it is fixed for the whole "
+            "sweep: pick it once, at the largest BYOG the study will ever ask "
+            "for." % (spec.byog_p_nom_mw, spec.byog_max_mw)
         )
 
     scenarios = named_scenarios(tables)
@@ -871,6 +898,16 @@ def datacenter_deltas(spec: DatacenterSpec,
             name="%s behind-the-meter generation" % spec.dc_name,
         )
     )
+    # Only when the per-run capacity is below the study ceiling. When the two
+    # are equal INJ_ID.MaxMw alone says everything, and an SCN_INJ_MAX row
+    # restating it would be a line of diff carrying no information.
+    if float(spec.byog_p_nom_mw) < float(spec.byog_max_mw):
+        deltas.append(
+            ScenarioOverride.of(
+                "SCN_INJ_MAX", "0", spec.byog_injector,
+                {"MaxMw": FMT_MW % float(spec.byog_p_nom_mw)},
+            )
+        )
     return deltas
 
 
@@ -887,15 +924,97 @@ def named_scenarios(tables: Dict[str, Table]) -> List[str]:
     return names or list(EXPECTED_SCENARIOS)
 
 
+# ------------------------------------------------------------------------------
+# stress_deltas()
+#
+# Expands the tall stress table (lever, target, mode, value) into deltas. Tall,
+# not wide, so a new lever adds ROWS to the operator's CSV rather than columns:
+# an operator who has never heard of the new lever sees a file that still reads
+# the way it did.
+#
+# An unrecognised lever or mode is a HARD ERROR naming what is implemented. A
+# skipped row would be the exact failure this component exists to prevent: the
+# sweep runs, the numbers move a little because something else changed, and the
+# lever the whole study rests on was never applied.
+# ------------------------------------------------------------------------------
 def stress_deltas(rows: Sequence[Dict[str, str]],
                   tables: Dict[str, Table]) -> List[Delta]:
-    raise NotImplementedError(
-        "stress_deltas() is Milestone 2. Every stress lever it expands "
-        "(k_load via SCN_ARA_LOD, BYOG sweeps via SCN_INJ_MAX) writes to a "
-        "table marked supported=False in the SCN_TABLES registry in this "
-        "module; adding a lever means one entry there, one referential rule "
-        "in verify_case() and one row in the design's merge table."
-    )
+    deltas: List[Delta] = []
+    implemented = ", ".join(sorted(STRESS_LEVERS))
+    for index, row in enumerate(rows, start=1):
+        lever = (row.get("lever") or "").strip()
+        target = (row.get("target") or "").strip()
+        mode = (row.get("mode") or "").strip()
+        value = (row.get("value") or "").strip()
+        if lever == "":
+            raise Ercot7kCaseError(
+                "stress row %d has no lever. A blank lever is not an empty "
+                "row to skip; delete the row instead." % index)
+        entry = STRESS_LEVERS.get(lever)
+        if entry is None:
+            raise Ercot7kCaseError(
+                "stress row %d names lever %r, which is not implemented. "
+                "Implemented levers: %s. An unrecognised lever is refused "
+                "rather than skipped -- a silently ignored lever produces a "
+                "run that looks stressed and is not. The extension point is "
+                "the STRESS_LEVERS registry in this module."
+                % (index, lever, implemented))
+        if mode not in entry["modes"]:
+            raise Ercot7kCaseError(
+                "stress row %d sets lever %s to mode %r; %s implements only "
+                "mode(s) %s. An unrecognised mode is refused rather than "
+                "defaulted, because a 'scale' read as an 'add' is a plausible "
+                "wrong number rather than a visible failure."
+                % (index, lever, mode, lever, ", ".join(entry["modes"])))
+        if target != entry["targets"]:
+            raise Ercot7kCaseError(
+                "stress row %d sets lever %s with target %r. %s takes a blank "
+                "target: %s"
+                % (index, lever, target, lever, entry["note"]))
+        if value == "":
+            raise Ercot7kCaseError(
+                "stress row %d sets lever %s with no value" % (index, lever))
+        magnitude = _as_float(value)
+        if magnitude != magnitude:  # NaN: _as_float could not read it
+            raise Ercot7kCaseError(
+                "stress row %d sets lever %s to value %r, which is not a "
+                "number" % (index, lever, value))
+
+        if lever == "k_load":
+            deltas.append(_k_load_delta(magnitude, tables))
+            continue
+        raise Ercot7kCaseError(
+            "lever %s is in STRESS_LEVERS but stress_deltas() has no branch "
+            "for it" % lever)
+    return deltas
+
+
+# ------------------------------------------------------------------------------
+# _k_load_delta()
+#
+# The k_load lever. The '*' form is not a convenience: see
+# _apply_area_load_override() for why a literal scenario here leaves the
+# reported cycle unscaled.
+# ------------------------------------------------------------------------------
+def _k_load_delta(factor: float, tables: Dict[str, Table]) -> Delta:
+    table = tables.get("SCN_ARA_LOD")
+    if table is None:
+        raise Ercot7kCaseError(
+            "k_load needs a SCN_ARA_LOD table and the case has none")
+    areas = sorted({r["Area"] for r in table.records()})
+    if len(areas) != 1:
+        raise NotImplementedError(
+            "SCN_ARA_LOD carries %d area(s) (%s). Per-area k_load is out of "
+            "scope; this lever scales one area's rows and V6 then asserts that "
+            "EVERY row carries the factor."
+            % (len(areas), ", ".join(areas) or "none"))
+    if factor <= 0.0:
+        raise Ercot7kCaseError(
+            "k_load value %s must be positive. VERIFIED, SCN_ARA_LOD.md: a "
+            "ScaleFactor of 0 is read as 1, so a zero k_load is not a zeroed "
+            "system, it is an untouched one." % factor)
+    return ScenarioOverride.of(
+        "SCN_ARA_LOD", "*", areas[0], {"ScaleFactor": FMT_MW % factor})
 
 
 # ------------------------------------------------------------------------------
@@ -973,8 +1092,13 @@ def schedule_tmp_values(schedule: str, time: str, value: float) -> Dict[str, str
 #   Layer writer
 # ------------------------------------------------------------------------------
 # Ownership rule, one line: adds are exclusive; edits are permitted but must
-# declare the value they expect to replace. This milestone implements adds
-# only, so every collision is an error.
+# declare the value they expect to replace.
+#
+# changed_files is per file {"added": [...], "edits": [...]}, and an edit records
+# the parent's exact raw line alongside the replacement. V9 replays that record
+# against the parent to reconstruct this layer byte for byte, so a rewrite is
+# held to the same standard as an append: the file may differ ONLY where the
+# manifest says it differs.
 # ------------------------------------------------------------------------------
 @dataclass
 class _LayerBuild:
@@ -982,7 +1106,7 @@ class _LayerBuild:
     prefix: str
     owned: List[Dict[str, Any]] = field(default_factory=list)
     owned_files: List[str] = field(default_factory=list)
-    changed_files: Dict[str, List[str]] = field(default_factory=dict)
+    changed_files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     new_tables: Dict[str, Table] = field(default_factory=dict)
     capacity_ceilings: Dict[str, float] = field(default_factory=dict)
 
@@ -992,7 +1116,8 @@ class _LayerBuild:
         return "%s_%s.csv" % (self.prefix, table_name)
 
     def record_owned(self, table: str, key: Sequence[str], op: str,
-                     fields: Dict[str, str]) -> None:
+                     fields: Dict[str, str],
+                     prior_values: Optional[Dict[str, str]] = None) -> None:
         self.owned.append({
             "table": table,
             "file": self.filename_for(table),
@@ -1000,15 +1125,57 @@ class _LayerBuild:
             "op": op,
             "fields": dict(fields),
             "prior_owner": None,
-            "prior_values": None,
+            "prior_values": dict(prior_values) if prior_values else None,
         })
+
+    def _change_entry(self, filename: str) -> Dict[str, Any]:
+        return self.changed_files.setdefault(
+            filename, {"added": [], "edits": []})
 
     def append(self, table_name: str, values: Dict[str, str]) -> None:
         table = self.tables[table_name]
         line = table.append_record(values)
         if table_name in self.new_tables:
             return
-        self.changed_files.setdefault(table.filename, []).append(line)
+        self._change_entry(table.filename)["added"].append(line)
+
+    # --------------------------------------------------------------------------
+    # edit_row()
+    #
+    # Rewrites one existing data row in place, keeping its position. Position
+    # matters: reordering SCN_INJ_MAX would show up in V9 as 334 changed lines
+    # and drown the two that were actually meant.
+    #
+    # The replacement is built from the row's own parsed field TEXT with only
+    # the named fields substituted, so every untouched field is written back as
+    # the characters it arrived as -- "746.000" cannot become "746.0" here.
+    # --------------------------------------------------------------------------
+    def edit_row(self, table_name: str, row_index: int,
+                 values: Dict[str, str]) -> Dict[str, str]:
+        table = self.tables[table_name]
+        if table_name in self.new_tables:
+            raise Ercot7kCaseError(
+                "%s was created by this layer; its rows are appends, not edits"
+                % table_name
+            )
+        line_index = row_index + 1
+        old_line = table.raw_lines[line_index]
+        columns = table.columns
+        record = dict(zip(columns, _parse_line(old_line)))
+        prior = {name: record.get(name, "") for name in values}
+        record.update(values)
+        new_line = _serialize_fields(
+            [record.get(column, "") for column in columns],
+            _terminator_of(old_line),
+        )
+        table.raw_lines[line_index] = new_line
+        entry = self._change_entry(table.filename)
+        entry["edits"].append({
+            "line_index": line_index,
+            "old": old_line,
+            "new": new_line,
+        })
+        return prior
 
 
 def _existing_keys(table: Table, key_fields: Sequence[str]) -> Dict[Tuple[str, ...], int]:
@@ -1194,10 +1361,19 @@ def _apply_scenario_override(build: _LayerBuild, delta: ScenarioOverride,
             "The extension point is the SCN_TABLES registry in this module."
             % (delta.table, entry.get("milestone"), entry.get("note", ""))
         )
+    if delta.table == "SCN_ARA_LOD":
+        _apply_area_load_override(build, delta)
+        return
+    if delta.table == "SCN_INJ_MAX":
+        _apply_injector_max_override(build, delta, owned_by)
+        return
     if delta.scenario == "*":
-        raise NotImplementedError(
-            "the '*' all-rows scenario form is only meaningful for "
-            "SCN_ARA_LOD, which is Milestone 2. See the SCN_TABLES registry."
+        raise Ercot7kCaseError(
+            "the '*' all-rows scenario form is not meaningful for %s. It "
+            "exists for tables this writer rewrites row by row (SCN_ARA_LOD, "
+            "and SCN_INJ_MAX for an injector that already carries schedule "
+            "rows); %s is create-or-append and needs a literal scenario."
+            % (delta.table, delta.table)
         )
     if delta.scenario not in scenarios:
         raise Ercot7kCaseError(
@@ -1215,6 +1391,255 @@ def _apply_scenario_override(build: _LayerBuild, delta: ScenarioOverride,
     values.update(delta.field_map())
     build.append(delta.table, values)
     build.record_owned(delta.table, key, "create-or-append", values)
+
+
+# ------------------------------------------------------------------------------
+# _apply_area_load_override() -- SCN_ARA_LOD, the k_load lever
+#
+# A WHOLE-FILE REWRITE TOUCHING EVERY ROW, not an append. VERIFIED,
+# SCN_ARA_LOD.md: "When assigned to the default scenario '0', it is applied only
+# to schedules and sequences also associated with the default scenario.
+# Non-default scenarios that do not have a ScaleFactor will be assigned a value
+# of 1."
+#
+# The base holds exactly two rows -- '0' -> Load_fcst and 'ScnRT' -> Load_act.
+# A ScaleFactor written only on row '0' scales SC and DA and leaves ScnRT, the
+# REPORTED cycle, at 1.0. The lever would look almost inert: the case runs, the
+# numbers move slightly because SC and DA commitment changed, and the load the
+# report is drawn from was never scaled at all. So the delta form is
+# ScenarioOverride("SCN_ARA_LOD", "*", "<area>", {...}) and a literal scenario
+# is refused with that explanation attached.
+#
+# Same page: "If ScaleFactor is not assigned a value or is assigned the value of
+# 0, then ScaleFactor = 1." A zero factor is therefore refused too -- it does
+# not zero the load, it silently becomes an untouched case.
+# ------------------------------------------------------------------------------
+def _apply_area_load_override(build: _LayerBuild,
+                              delta: ScenarioOverride) -> None:
+    table = build.tables.get("SCN_ARA_LOD")
+    if table is None:
+        raise Ercot7kCaseError(
+            "the case has no SCN_ARA_LOD table, so there is no area load to "
+            "scale. k_load edits existing rows; it never creates the table."
+        )
+    if delta.scenario != "*":
+        raise Ercot7kCaseError(
+            "SCN_ARA_LOD takes the '*' all-rows form, never a literal scenario "
+            "such as %r. VERIFIED, SCN_ARA_LOD.md: a ScaleFactor assigned to "
+            "the default scenario '0' applies only to schedules also "
+            "associated with the default scenario, and 'non-default scenarios "
+            "that do not have a ScaleFactor will be assigned a value of 1'. "
+            "This case has one row on '0' (Load_fcst, driving SC and DA) and "
+            "one on 'ScnRT' (Load_act, driving the REPORTED cycle), so a "
+            "factor written to a single scenario leaves the reported cycle at "
+            "1.0 and the lever looks almost inert."
+            % (delta.scenario,)
+        )
+
+    fields = delta.field_map()
+    unsupported = sorted(set(fields) - {"ScaleFactor"})
+    if unsupported:
+        raise NotImplementedError(
+            "SCN_ARA_LOD override sets %s; only ScaleFactor (the k_load lever) "
+            "is implemented. Load, Enforce, Schedule and Sequence edits are "
+            "out of scope -- the extension point is _apply_area_load_override() "
+            "in this module." % ", ".join(unsupported)
+        )
+    factor_text = fields.get("ScaleFactor", "")
+    if factor_text.strip() == "" or _as_float(factor_text) == 0.0:
+        raise Ercot7kCaseError(
+            "SCN_ARA_LOD.ScaleFactor %r is blank or zero. VERIFIED, "
+            "SCN_ARA_LOD.md: 'If ScaleFactor is not assigned a value or is "
+            "assigned the value of 0, then ScaleFactor = 1.' A zero factor "
+            "does not zero the load, it silently becomes an untouched case. To "
+            "actually zero area load the documented route is Enforce=1 with "
+            "Load=0 and no Schedule or Sequence, which is out of scope here."
+            % (factor_text,)
+        )
+
+    records = table.records()
+    if not records:
+        raise Ercot7kCaseError(
+            "SCN_ARA_LOD has no rows, so there is nothing for k_load to scale"
+        )
+    other_areas = sorted({r["Area"] for r in records if r["Area"] != delta.key})
+    if other_areas:
+        raise NotImplementedError(
+            "SCN_ARA_LOD carries area(s) %s besides %r. Per-area k_load is out "
+            "of scope, and V6 requires EVERY row to carry the intended "
+            "ScaleFactor, so a factor aimed at one area of several would be "
+            "reported as a failure rather than as a partial write. The "
+            "extension point is _apply_area_load_override() in this module."
+            % (", ".join(other_areas), delta.key)
+        )
+
+    for index, record in enumerate(records):
+        prior = build.edit_row("SCN_ARA_LOD", index, fields)
+        updated = dict(record)
+        updated.update(fields)
+        build.record_owned(
+            "SCN_ARA_LOD", (record["Scenario"], record["Area"]),
+            "read-modify-rewrite", updated, prior_values=prior,
+        )
+
+
+# ------------------------------------------------------------------------------
+# _apply_injector_max_override() -- SCN_INJ_MAX
+#
+# A READ-MERGE over two disjoint populations, so what the writer does depends on
+# whether the injector already has rows:
+#
+#   already present (the 167 renewables, each with a '0' -> <unit>_fcst row and
+#   a 'ScnRT' -> <unit>_act row): ScaleFactor ONLY, applied by editing both
+#   existing rows in place with Schedule untouched. A MaxMw for such an injector
+#   is a HARD ERROR. VERIFIED, SCN_ARA_LOD.md's general scenario notes, which
+#   govern every SCN_* table: the priority is Sequence, then Schedule, then the
+#   static value. The schedules cover every interval, so a static MaxMw is
+#   ignored for all of them -- no error, no warning, and the capacity lever the
+#   operator asked for did nothing.
+#
+#   not present (the other 467, plus anything this writer added): append
+#   Scenario=0, Injector=<inj>, MaxMw=<mw>. One '0' row covers all three
+#   scenarios because "the default scenario ('0') identifies default data for
+#   all scenarios without scenario-specific data" and no named scenario carries
+#   a row for that injector.
+#
+# Existing row order is preserved and new rows go at the end. A reordering would
+# show in V9 as 334 changed lines and drown the ones that matter.
+# ------------------------------------------------------------------------------
+def _apply_injector_max_override(build: _LayerBuild, delta: ScenarioOverride,
+                                 owned_by: Dict[Tuple[str, Tuple[str, ...]], str],
+                                 ) -> None:
+    table = build.tables.get("SCN_INJ_MAX")
+    if table is None:
+        raise Ercot7kCaseError(
+            "the case has no SCN_INJ_MAX table. This writer merges into the "
+            "existing one rather than authoring a header for it, because the "
+            "read-merge rule depends on knowing which injectors already carry "
+            "availability schedules."
+        )
+    fields = delta.field_map()
+    unsupported = sorted(set(fields) - {"MaxMw", "ScaleFactor"})
+    if unsupported:
+        raise NotImplementedError(
+            "SCN_INJ_MAX override sets %s; only MaxMw and ScaleFactor are "
+            "implemented. The extension point is "
+            "_apply_injector_max_override() in this module."
+            % ", ".join(unsupported)
+        )
+
+    records = table.records()
+    mine = [(index, r) for index, r in enumerate(records)
+            if r["Injector"] == delta.key]
+
+    if mine:
+        schedules = ", ".join(
+            "%s -> %s" % (r["Scenario"], r["Schedule"] or "(none)")
+            for _, r in mine)
+        if "MaxMw" in fields:
+            raise Ercot7kCaseError(
+                "SCN_INJ_MAX already carries %d row(s) for injector %s (%s), "
+                "so MaxMw cannot be set on it. The documented priority is "
+                "Sequence, then Schedule, then the static value, and those "
+                "schedules cover every interval -- a static MaxMw would be "
+                "ignored for all of them with no error and no warning. Use "
+                "ScaleFactor, which is what scales a Schedule, or lower "
+                "INJ_ID.MaxMw if the nameplate itself is meant to change."
+                % (len(mine), delta.key, schedules)
+            )
+        if delta.scenario != "*":
+            raise Ercot7kCaseError(
+                "injector %s already has SCN_INJ_MAX rows (%s), so an override "
+                "on it must use the '*' all-rows form: a ScaleFactor written "
+                "to one scenario leaves the others at 1 and the lever reaches "
+                "only part of the run. Scenario given was %r."
+                % (delta.key, schedules, delta.scenario)
+            )
+        if "ScaleFactor" not in fields:
+            raise Ercot7kCaseError(
+                "SCN_INJ_MAX override on %s sets no field" % delta.key)
+        factor = fields["ScaleFactor"]
+        if factor.strip() == "" or _as_float(factor) == 0.0:
+            raise Ercot7kCaseError(
+                "SCN_INJ_MAX.ScaleFactor %r on %s is blank or zero. A zero "
+                "scale factor reads as 1, so it does not zero the unit; "
+                "Enforce with MaxMw=0 is the documented route and is out of "
+                "scope here." % (factor, delta.key)
+            )
+        for index, record in mine:
+            prior = build.edit_row("SCN_INJ_MAX", index, fields)
+            updated = dict(record)
+            updated.update(fields)
+            build.record_owned(
+                "SCN_INJ_MAX", (record["Scenario"], record["Injector"]),
+                "read-merge-edit", updated, prior_values=prior,
+            )
+        return
+
+    # ----- the injector has no SCN_INJ_MAX row: append one on scenario '0' -----
+    if delta.scenario == "*":
+        raise Ercot7kCaseError(
+            "injector %s has no SCN_INJ_MAX rows, so there is nothing for the "
+            "'*' all-rows form to rewrite. Append a MaxMw on the default "
+            "scenario '0' instead: it covers every scenario because no named "
+            "scenario carries a row for this injector." % delta.key
+        )
+    if delta.scenario != "0":
+        raise Ercot7kCaseError(
+            "injector %s has no SCN_INJ_MAX rows and the override names "
+            "scenario %r. Write the default scenario '0': it applies to every "
+            "scenario without scenario-specific data, so one row covers SC, DA "
+            "and RT, while a single named scenario would leave the other two "
+            "uncapped." % (delta.key, delta.scenario)
+        )
+    if "ScaleFactor" in fields:
+        raise Ercot7kCaseError(
+            "SCN_INJ_MAX.ScaleFactor on %s has nothing to scale: ScaleFactor "
+            "is 'a factor used to scale Schedule and Sequence' and this "
+            "injector carries neither. Set MaxMw instead." % delta.key
+        )
+    if "MaxMw" not in fields:
+        raise Ercot7kCaseError(
+            "SCN_INJ_MAX override on %s sets no field" % delta.key)
+
+    nameplate = {r["Injector"]: r for r in build.tables["INJ_ID"].records()}
+    if delta.key not in nameplate:
+        raise Ercot7kCaseError(
+            "SCN_INJ_MAX names injector %r, which is not in INJ_ID" % delta.key)
+    wanted = _as_float(fields["MaxMw"])
+    ceiling = _as_float(nameplate[delta.key].get("MaxMw", ""))
+    if wanted > ceiling:
+        raise Ercot7kCaseError(
+            "SCN_INJ_MAX.MaxMw %s for %s is above INJ_ID.MaxMw %s. "
+            "SCN_INJ_MAX 'identifies more restrictive MaxMw' -- it can only "
+            "restrict, never raise -- so the run would be silently capped at "
+            "%s and every point of the sweep past that would report the same "
+            "number. Raise INJ_ID.MaxMw (byog_max_mw, the study ceiling) if a "
+            "larger unit is intended."
+            % (fields["MaxMw"], delta.key, nameplate[delta.key].get("MaxMw"),
+               nameplate[delta.key].get("MaxMw"))
+        )
+    commitment = {r["Injector"]: r for r in
+                  (build.tables["INJ_CMT"].records()
+                   if "INJ_CMT" in build.tables else [])}
+    if delta.key in commitment:
+        floor = _as_float(commitment[delta.key].get("MinDispatch", ""))
+        if wanted < floor:
+            raise Ercot7kCaseError(
+                "SCN_INJ_MAX.MaxMw %s for %s is below its INJ_CMT.MinDispatch "
+                "%s. VERIFIED, SCN_INJ_MAX.md: 'Limit cannot be more "
+                "restrictive than MinDispatch (INJ_CMT).'"
+                % (fields["MaxMw"], delta.key,
+                   commitment[delta.key].get("MinDispatch"))
+            )
+
+    key = ("0", delta.key)
+    _check_add_collision(build, "SCN_INJ_MAX", ("Scenario", "Injector"),
+                         key, owned_by)
+    values = {"Scenario": "0", "Injector": delta.key}
+    values.update(fields)
+    build.append("SCN_INJ_MAX", values)
+    build.record_owned("SCN_INJ_MAX", key, "read-merge-append", values)
 
 
 def _create_new_scn_table(build: _LayerBuild, table_name: str) -> None:
@@ -1394,9 +1819,130 @@ def build_datacenter_layer(base_dir: Path, out_dir: Path,
                        strict_monitored=strict_monitored)
 
 
+# ------------------------------------------------------------------------------
+# build_stress_layer()
+#
+# One stress layer from the tall (lever, target, mode, value) rows. The rows go
+# into the manifest verbatim as well as through the expander, so a later reader
+# can see what was ASKED for next to what was written -- the two agreeing is the
+# whole claim this component makes.
+# ------------------------------------------------------------------------------
+def build_stress_layer(base_dir: Path, out_dir: Path,
+                       rows: Sequence[Dict[str, str]],
+                       slug: str = "stress",
+                       strict_monitored: bool = False) -> Dict[str, Any]:
+    base_dir = Path(base_dir)
+    tables = read_case(base_dir)
+    deltas = stress_deltas(rows, tables)
+    if not deltas:
+        raise Ercot7kCaseError(
+            "the stress configuration expanded to no deltas, so this layer "
+            "would be a byte-identical copy of its parent under a new name")
+    study = {
+        "datacenters": [],
+        "stress": [{"lever": (r.get("lever") or "").strip(),
+                    "target": (r.get("target") or "").strip(),
+                    "mode": (r.get("mode") or "").strip(),
+                    "value": (r.get("value") or "").strip()} for r in rows],
+    }
+    return write_layer(base_dir, out_dir, deltas, study=study, slug=slug,
+                       strict_monitored=strict_monitored)
+
+
 def layer_dir_name(parent_dir: Path, slug: str) -> str:
     """Layer directories are named <parent>__<slug> so a chain reads from ls."""
     return "%s__%s" % (Path(parent_dir).name, slug)
+
+
+# ------------------------------------------------------------------------------
+# case_summary()
+#
+# The numbers an operator needs to recognise the case in front of them. Read
+# here rather than in the front end so that the front end holds no table
+# knowledge at all: it prints what this returns.
+#
+# forecast_peak_mw is the largest value of the schedule the DEFAULT scenario '0'
+# row of SCN_ARA_LOD points at -- the forecast the SC and DA cycles plan to. It
+# is a schedule peak, not a served-load figure, and nothing here has solved
+# anything.
+# ------------------------------------------------------------------------------
+def case_summary(tables: Dict[str, Table]) -> Dict[str, Any]:
+    def count(name: str) -> int:
+        table = tables.get(name)
+        return len(table.data_lines) if table else 0
+
+    schedule = ""
+    for record in (tables["SCN_ARA_LOD"].records()
+                   if "SCN_ARA_LOD" in tables else []):
+        if record.get("Scenario") == "0" and record.get("Schedule"):
+            schedule = record["Schedule"]
+            break
+    peak = None
+    if schedule:
+        values = [_as_float(r["Value"])
+                  for _, table in sch_tmp_tables(tables)
+                  for r in table.records() if r["Schedule"] == schedule]
+        peak = max(values) if values else None
+
+    mdl = model_id(tables)
+    return {
+        "nodes": count("NDE_ID"),
+        "branches": count("BRN_ID"),
+        "injectors": count("INJ_ID"),
+        "schedules": count("SCH_ATT"),
+        "min_date": mdl.get("MinDate", ""),
+        "max_date": mdl.get("MaxDate", ""),
+        "timepoints": len(model_timepoints(tables)),
+        "cycles": [r["Cycle"] for r in tables["CYC_ID"].records()]
+        if "CYC_ID" in tables else [],
+        "scenarios": named_scenarios(tables),
+        "forecast_schedule": schedule,
+        "forecast_peak_mw": peak,
+    }
+
+
+# ------------------------------------------------------------------------------
+# node_report()
+#
+# Everything the front end needs to say about a candidate datacenter node: does
+# it exist, what voltage class is it, and is it an endpoint of a Monitor=1
+# branch. The last one is V8 asked in advance -- only 1171 of 9140 branches are
+# monitored, and a datacenter at an unmonitored bus creates congestion the model
+# never reports.
+#
+# NDE_ID carries no voltage column in this case, so the node's voltage class is
+# read off the branches that touch it (BRN_ID.Voltage). A node whose branches
+# disagree gets all of them listed rather than a single number picked for it.
+# ------------------------------------------------------------------------------
+def node_report(tables: Dict[str, Table], node: str) -> Dict[str, Any]:
+    nodes = {r["Enode"]: r for r in
+             (tables["NDE_ID"].records() if "NDE_ID" in tables else [])}
+    record = nodes.get(node)
+    monitored = 0
+    touching = 0
+    voltages: List[str] = []
+    for branch in (tables["BRN_ID"].records() if "BRN_ID" in tables else []):
+        if node not in (branch["FrEnode"], branch["ToEnode"]):
+            continue
+        touching += 1
+        voltage = branch.get("Voltage", "")
+        if voltage and voltage not in voltages:
+            voltages.append(voltage)
+        if branch.get("Monitor") == "1":
+            monitored += 1
+    hosted = [r["Injector"] for r in
+              (tables["INJ_NET"].records() if "INJ_NET" in tables else [])
+              if r["Node"] == node]
+    return {
+        "node": node,
+        "exists": record is not None,
+        "name": (record or {}).get("Name", ""),
+        "substation": (record or {}).get("Substation", ""),
+        "voltages": sorted(voltages),
+        "branches": touching,
+        "monitored_branches": monitored,
+        "hosted_injectors": hosted,
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -1748,10 +2294,10 @@ def _v5_scenario_rows(ctx: _VerifyContext) -> List[Finding]:
 # ------------------------------------------------------------------------------
 # V6 -- SCN_ARA_LOD.ScaleFactor reaches every row, and is never zero
 #
-# The write itself is Milestone 2. The check is wired now because a zero
-# ScaleFactor silently becomes 1, and a factor written only to the default
-# scenario '0' leaves ScnRT -- the reported cycle -- at 1.0, making the lever
-# look almost inert.
+# A zero ScaleFactor silently becomes 1, and a factor written only to the
+# default scenario '0' leaves ScnRT -- the reported cycle -- at 1.0, making the
+# k_load lever look almost inert. This is the check that says the write landed
+# on every row rather than on the one the delta happened to name.
 # ------------------------------------------------------------------------------
 def _v6_area_load_scale(ctx: _VerifyContext) -> List[Finding]:
     rows = ctx.rec("SCN_ARA_LOD")
@@ -1779,9 +2325,9 @@ def _v6_area_load_scale(ctx: _VerifyContext) -> List[Finding]:
                                    % (len(missing), wanted)))
     else:
         out.append(Finding("V6", LEVEL_SKIP,
-                           "no manifest-owned SCN_ARA_LOD rows (k_load is "
-                           "Milestone 2); checked %d existing row(s) for a "
-                           "zero ScaleFactor only" % len(rows)))
+                           "no manifest-owned SCN_ARA_LOD rows (no k_load "
+                           "layer here); checked %d existing row(s) for a zero "
+                           "ScaleFactor only" % len(rows)))
     if not any(f.level == LEVEL_ERROR for f in out) and owned:
         out.append(Finding("V6", LEVEL_OK,
                            "every SCN_ARA_LOD row carries the intended "
@@ -1884,14 +2430,39 @@ def _v9_parent_diff(ctx: _VerifyContext) -> List[Finding]:
                 source.read_bytes().decode("ascii"))
             child_lines = _split_lines_keepends(
                 target.read_bytes().decode("ascii"))
-            added = declared[source.name]
-            if child_lines != parent_lines + added:
+            entry = declared[source.name]
+            added = entry.get("added", [])
+            edits = entry.get("edits", [])
+            # Replay the declared record against the parent. Reconstruction is
+            # stricter than a line count: an edit whose "old" no longer matches
+            # the parent line at that index means the parent moved under the
+            # layer, and an undeclared change anywhere else falls out of the
+            # final comparison.
+            expected = list(parent_lines)
+            stale: List[str] = []
+            for edit in edits:
+                index = int(edit["line_index"])
+                if index >= len(expected):
+                    stale.append("line %d is past the end of the parent" % index)
+                    continue
+                if expected[index] != edit["old"]:
+                    stale.append("line %d is not the line the manifest says it "
+                                 "replaced" % index)
+                    continue
+                expected[index] = edit["new"]
+            expected.extend(added)
+            if stale:
+                out.append(Finding("V9", LEVEL_ERROR,
+                                   "%s declares edit(s) that do not match the "
+                                   "parent: %s"
+                                   % (source.name, "; ".join(stale[:10]))))
+            elif child_lines != expected:
                 out.append(Finding("V9", LEVEL_ERROR,
                                    "%s differs from the parent in lines the "
                                    "manifest does not declare (parent %d lines, "
-                                   "here %d, declared %d added)"
+                                   "here %d, declared %d added and %d edited)"
                                    % (source.name, len(parent_lines),
-                                      len(child_lines), len(added))))
+                                      len(child_lines), len(added), len(edits))))
         else:
             if source.read_bytes() != target.read_bytes():
                 out.append(Finding("V9", LEVEL_ERROR,
@@ -1967,23 +2538,48 @@ def _v10_file_set(ctx: _VerifyContext) -> List[Finding]:
 # V11 -- capacity ceilings
 #
 # Every SCN_INJ_MAX.MaxMw must sit at or below the injector's INJ_ID.MaxMw, and
-# byog_p_nom must equal byog_max_mw until SCN_INJ_MAX support lands. Otherwise
-# a stress step is silently capped at the ceiling.
+# at or below any ceiling an ancestor layer declared for it.
+#
+# SCN_INJ_MAX "identifies more restrictive MaxMw" -- it can only restrict, never
+# raise. So a per-run capacity above the nameplate does not error and does not
+# warn: the run is silently capped at the ceiling, and every sweep point past
+# that ceiling reports the same number, which reads as a plateau in the data
+# rather than as a broken input.
+#
+# The Milestone 1 rule this replaces was byog_p_nom == byog_max_mw, which was
+# only ever a stand-in for the ceiling check while there was no way to express a
+# per-run BYOG capacity. There is now: INJ_ID.MaxMw carries byog_max_mw (the
+# study ceiling, fixed for the whole sweep) and SCN_INJ_MAX.MaxMw carries
+# byog_p_nom (this run).
 # ------------------------------------------------------------------------------
 def _v11_capacity_ceiling(ctx: _VerifyContext) -> List[Finding]:
     out: List[Finding] = []
     nameplate = {r["Injector"]: _as_float(r.get("MaxMw", ""))
                  for r in ctx.rec("INJ_ID")}
+    declared = dict((ctx.manifest or {}).get("capacity_ceilings") or {})
     rows = [r for r in ctx.rec("SCN_INJ_MAX")
             if (r.get("MaxMw") or "").strip() != ""]
-    over = ["%s %s > %s" % (r["Injector"], r["MaxMw"],
-                            nameplate.get(r["Injector"]))
-            for r in rows
-            if _as_float(r["MaxMw"]) > nameplate.get(r["Injector"], 0.0)]
+
+    over: List[str] = []
+    for record in rows:
+        injector = record["Injector"]
+        wanted = _as_float(record["MaxMw"])
+        plate = nameplate.get(injector)
+        if plate is None:
+            over.append("%s is not in INJ_ID" % injector)
+            continue
+        if wanted > plate:
+            over.append("%s SCN_INJ_MAX.MaxMw %s > INJ_ID.MaxMw %s"
+                        % (injector, record["MaxMw"], plate))
+        ceiling = declared.get(injector)
+        if ceiling is not None and wanted > float(ceiling):
+            over.append("%s SCN_INJ_MAX.MaxMw %s > the ceiling %s declared for "
+                        "it in the chain" % (injector, record["MaxMw"], ceiling))
     if over:
         out.append(Finding("V11", LEVEL_ERROR,
-                           "SCN_INJ_MAX.MaxMw above INJ_ID.MaxMw: %s"
-                           % "; ".join(over[:10])))
+                           "SCN_INJ_MAX can only restrict INJ_ID.MaxMw, never "
+                           "raise it, so a run above the ceiling is silently "
+                           "capped: %s" % "; ".join(over[:10])))
     if not rows:
         out.append(Finding("V11", LEVEL_SKIP,
                            "no SCN_INJ_MAX row carries a MaxMw value"))
@@ -1992,29 +2588,49 @@ def _v11_capacity_ceiling(ctx: _VerifyContext) -> List[Finding]:
     if ctx.manifest:
         for entry in (ctx.manifest.get("study") or {}).get("datacenters", []):
             checked += 1
-            if float(entry.get("byog_p_nom_mw", 0.0)) != float(
-                    entry.get("byog_max_mw", 0.0)):
+            byog = entry.get("byog_injector")
+            p_nom = float(entry.get("byog_p_nom_mw", 0.0))
+            ceiling = float(entry.get("byog_max_mw", 0.0))
+            if p_nom > ceiling:
                 out.append(Finding("V11", LEVEL_ERROR,
-                                   "%s byog_p_nom_mw != byog_max_mw and "
-                                   "SCN_INJ_MAX support has not landed, so "
-                                   "INJ_ID.MaxMw alone sets BYOG capacity"
-                                   % entry.get("dc_name")))
-            ceiling = (ctx.manifest.get("capacity_ceilings") or {}).get(
-                entry.get("byog_injector"))
-            plate = nameplate.get(entry.get("byog_injector"))
-            if ceiling is not None and plate is not None and float(ceiling) != plate:
+                                   "%s byog_p_nom_mw %s is above byog_max_mw "
+                                   "%s; SCN_INJ_MAX cannot raise INJ_ID.MaxMw"
+                                   % (entry.get("dc_name"), p_nom, ceiling)))
+            plate = nameplate.get(byog)
+            if plate is not None and plate != ceiling:
+                out.append(Finding("V11", LEVEL_ERROR,
+                                   "%s INJ_ID.MaxMw %s does not carry "
+                                   "byog_max_mw %s, so the study ceiling is "
+                                   "not the ceiling the case enforces"
+                                   % (byog, plate, ceiling)))
+            recorded = declared.get(byog)
+            if recorded is not None and plate is not None and float(recorded) != plate:
                 out.append(Finding("V11", LEVEL_ERROR,
                                    "%s capacity ceiling %s does not match "
-                                   "INJ_ID.MaxMw %s"
-                                   % (entry.get("byog_injector"), ceiling, plate)))
-    if checked and not any(f.level == LEVEL_ERROR for f in out):
-        out.append(Finding("V11", LEVEL_OK,
-                           "%d datacenter(s) have byog_p_nom == byog_max_mw == "
-                           "INJ_ID.MaxMw" % checked))
-    elif not checked:
+                                   "INJ_ID.MaxMw %s" % (byog, recorded, plate)))
+            if p_nom < ceiling:
+                capped = [r for r in rows if r["Injector"] == byog]
+                if not capped:
+                    out.append(Finding("V11", LEVEL_ERROR,
+                                       "%s byog_p_nom_mw %s is below "
+                                       "byog_max_mw %s but no SCN_INJ_MAX row "
+                                       "restricts it, so the run would use the "
+                                       "full ceiling" % (byog, p_nom, ceiling)))
+                elif _as_float(capped[0]["MaxMw"]) != p_nom:
+                    out.append(Finding("V11", LEVEL_ERROR,
+                                       "%s SCN_INJ_MAX.MaxMw %s does not carry "
+                                       "byog_p_nom_mw %s"
+                                       % (byog, capped[0]["MaxMw"], p_nom)))
+    if not checked:
         out.append(Finding("V11", LEVEL_SKIP,
                            "no manifest datacenter entry to check byog_p_nom "
                            "against byog_max_mw"))
+    if not any(f.level == LEVEL_ERROR for f in out) and (rows or checked):
+        out.append(Finding("V11", LEVEL_OK,
+                           "%d SCN_INJ_MAX.MaxMw row(s) at or below "
+                           "INJ_ID.MaxMw, %d datacenter(s) with byog_p_nom <= "
+                           "byog_max_mw == INJ_ID.MaxMw"
+                           % (len(rows), checked)))
     return out
 
 

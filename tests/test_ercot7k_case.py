@@ -327,10 +327,11 @@ def test_a_zero_mw_datacenter_sets_enforce(mini_base: Path, tmp_path: Path):
     assert overrides and all(d.field_map()["Enforce"] == "1" for d in overrides)
 
 
-def test_scenario_override_on_an_unsupported_table_names_the_registry(
+def test_scenario_override_on_an_unregistered_table_names_the_registry(
         mini_base: Path, tmp_path: Path):
-    for table_name in ("SCN_ARA_LOD", "SCN_INJ_MAX"):
-        delta = ec.ScenarioOverride.of(table_name, "ScnRT", "0",
+    """Out of scope, absent rather than stubbed: the error names the way in."""
+    for table_name in ("SCN_INJ_CST", "SCN_INJ_OUT", "SCN_BRN_LMT"):
+        delta = ec.ScenarioOverride.of(table_name, "ScnRT", "X",
                                        {"ScaleFactor": "1.200"})
         with pytest.raises(NotImplementedError, match="SCN_TABLES"):
             ec.write_layer(mini_base, tmp_path / table_name, [delta])
@@ -341,11 +342,6 @@ def test_field_edit_is_absent_and_names_its_extension_point(mini_base: Path,
     delta = ec.FieldEdit("BRN_ID", ("N110001_N110041_1",), "Monitor", "0", "1")
     with pytest.raises(NotImplementedError, match="apply_deltas"):
         ec.write_layer(mini_base, tmp_path / "fe", [delta])
-
-
-def test_stress_deltas_is_absent_and_names_its_extension_point():
-    with pytest.raises(NotImplementedError, match="SCN_TABLES"):
-        ec.stress_deltas([], {})
 
 
 # ------------------------------------------------------------------------------
@@ -468,11 +464,11 @@ def test_a_positive_min_mw_is_refused(mini_base: Path, tmp_path: Path):
         ec.write_layer(mini_base, tmp_path / "minmw", deltas)
 
 
-def test_byog_p_nom_differing_from_byog_max_mw_is_refused(mini_base: Path,
-                                                          tmp_path: Path):
-    """Until SCN_INJ_MAX lands, INJ_ID.MaxMw alone sets BYOG capacity."""
-    spec = mini_spec(byog_p_nom_mw=25.0, byog_max_mw=50.0)
-    with pytest.raises(NotImplementedError, match="SCN_INJ_MAX"):
+def test_byog_p_nom_above_byog_max_mw_is_refused(mini_base: Path,
+                                                 tmp_path: Path):
+    """SCN_INJ_MAX can only restrict INJ_ID.MaxMw, so the run would be capped."""
+    spec = mini_spec(byog_p_nom_mw=75.0, byog_max_mw=50.0)
+    with pytest.raises(ec.Ercot7kCaseError, match="study ceiling"):
         ec.build_datacenter_layer(mini_base, tmp_path / "byog", spec)
 
 
@@ -524,3 +520,402 @@ def test_a_rejected_layer_leaves_nothing_behind(mini_base: Path,
         ec.write_layer(mini_base, out,
                        [ec.AddInjector("N111180_1", MONITORED_NODE, True, 1.0)])
     assert not out.exists()
+
+
+# ------------------------------------------------------------------------------
+#   7. ScenarioOverride on SCN_ARA_LOD -- the k_load lever
+#
+#   SCN_ARA_LOD is a whole-file rewrite touching EVERY row, not an append.
+#   VERIFIED, SCN_ARA_LOD.md: a ScaleFactor "assigned to the default scenario
+#   '0' is applied only to schedules and sequences also associated with the
+#   default scenario. Non-default scenarios that do not have a ScaleFactor will
+#   be assigned a value of 1." The fixture holds both base rows -- '0' ->
+#   Load_fcst driving SC and DA, and ScnRT -> Load_act driving the REPORTED
+#   cycle -- so a factor on one row only would leave the reported cycle at 1.0.
+# ------------------------------------------------------------------------------
+def k_load(factor: str, area: str = "0") -> ec.ScenarioOverride:
+    return ec.ScenarioOverride.of("SCN_ARA_LOD", "*", area,
+                                  {"ScaleFactor": factor})
+
+
+def test_k_load_reaches_every_scn_ara_lod_row(mini_base: Path, tmp_path: Path):
+    layer = tmp_path / "kload"
+    ec.write_layer(mini_base, layer, [k_load("1.200")], slug="k")
+    rows = ec.read_table(layer / "texas7k_SCN_ARA_LOD.csv").records()
+    assert [r["Scenario"] for r in rows] == ["0", "ScnRT"]
+    assert all(r["ScaleFactor"] == "1.200" for r in rows), (
+        "a factor that misses ScnRT leaves the reported cycle unscaled")
+    # The lever must not disturb the schedule mapping it scales.
+    assert [r["Schedule"] for r in rows] == ["Load_fcst", "Load_act"]
+    assert not ec.has_errors(ec.verify_case(layer))
+
+
+def test_k_load_on_a_literal_scenario_is_refused(mini_base: Path,
+                                                 tmp_path: Path):
+    delta = ec.ScenarioOverride.of("SCN_ARA_LOD", "0", "0",
+                                   {"ScaleFactor": "1.200"})
+    with pytest.raises(ec.Ercot7kCaseError, match="reported cycle"):
+        ec.write_layer(mini_base, tmp_path / "literal", [delta])
+
+
+def test_a_zero_k_load_is_refused(mini_base: Path, tmp_path: Path):
+    """VERIFIED: a ScaleFactor of 0 is silently read as 1, not as zero load."""
+    with pytest.raises(ec.Ercot7kCaseError, match="ScaleFactor = 1"):
+        ec.write_layer(mini_base, tmp_path / "zero", [k_load("0.000")])
+    with pytest.raises(ec.Ercot7kCaseError, match="ScaleFactor = 1"):
+        ec.write_layer(mini_base, tmp_path / "blank", [k_load("")])
+
+
+def test_a_k_load_layer_changes_only_the_declared_lines(mini_base: Path,
+                                                        tmp_path: Path):
+    """The rewrite is held to the same byte standard as an append."""
+    layer = tmp_path / "kload"
+    manifest = ec.write_layer(mini_base, layer, [k_load("1.200")], slug="k")
+
+    assert set(manifest["changed_files"]) == {"texas7k_SCN_ARA_LOD.csv"}
+    entry = manifest["changed_files"]["texas7k_SCN_ARA_LOD.csv"]
+    assert entry["added"] == []
+    assert len(entry["edits"]) == 2
+    assert manifest["owned_files"] == []
+
+    for path in ec.case_files(mini_base):
+        target = layer / path.name
+        if path.name == "texas7k_SCN_ARA_LOD.csv":
+            parent = path.read_bytes().decode("ascii").splitlines()
+            child = target.read_bytes().decode("ascii").splitlines()
+            assert len(parent) == len(child)
+            differing = [i for i, (a, b) in enumerate(zip(parent, child))
+                         if a != b]
+            assert differing == [1, 2], "only the two data rows may differ"
+        else:
+            assert target.read_bytes() == path.read_bytes(), path.name
+
+
+def test_a_tampered_k_load_rewrite_fails_the_v9_line_diff(mini_base: Path,
+                                                          tmp_path: Path):
+    layer = tmp_path / "kload"
+    ec.write_layer(mini_base, layer, [k_load("1.200")], slug="k")
+    target = layer / "texas7k_SCN_ARA_LOD.csv"
+    target.write_bytes(target.read_bytes().replace(b"1.200", b"1.900"))
+    findings = ec.verify_case(layer)
+    v9 = [f for f in findings if f.check == "V9" and f.level == ec.LEVEL_ERROR]
+    assert v9, ec.format_findings(findings)
+
+
+def test_a_parent_edited_under_a_k_load_layer_fails_the_v9_replay(
+        mini_base: Path, tmp_path: Path):
+    """Every declared edit names the exact parent line it replaced."""
+    layer = tmp_path / "kload"
+    ec.write_layer(mini_base, layer, [k_load("1.200")], slug="k")
+    parent = mini_base / "texas7k_SCN_ARA_LOD.csv"
+    parent.write_bytes(parent.read_bytes().replace(b"Load_act", b"Load_fcst"))
+    findings = ec.verify_case(layer)
+    v9 = [f for f in findings
+          if f.check == "V9" and f.level == ec.LEVEL_ERROR
+          and "do not match the parent" in f.message]
+    assert v9, ec.format_findings(findings)
+
+
+def test_a_k_load_that_misses_a_row_is_caught_by_v6(mini_base: Path,
+                                                    tmp_path: Path):
+    """The silent failure itself: ScnRT, the reported cycle, left at 1.0."""
+    layer = tmp_path / "kload"
+    ec.write_layer(mini_base, layer, [k_load("1.200")], slug="k")
+    target = layer / "texas7k_SCN_ARA_LOD.csv"
+    target.write_bytes(
+        target.read_bytes().replace(b"ScnRT,0,,,1.200,", b"ScnRT,0,,,,"))
+    findings = ec.verify_case(layer)
+    v6 = [f for f in findings if f.check == "V6" and f.level == ec.LEVEL_ERROR]
+    assert v6, ec.format_findings(findings)
+
+
+# ------------------------------------------------------------------------------
+#   8. ScenarioOverride on SCN_INJ_MAX -- two disjoint populations
+#
+#   SCHEDULED_INJECTORS already carry a '0' -> <unit>_fcst row and a ScnRT ->
+#   <unit>_act row, so they may set ScaleFactor only. PLAIN_INJECTORS carry no
+#   SCN_INJ_MAX row at all, so they take an appended MaxMw on scenario '0'.
+# ------------------------------------------------------------------------------
+SCHEDULED_INJECTORS = ("N220149_1", "N220151_1")
+PLAIN_INJECTORS = ("N111180_1", "N111181_1", "N111333_1")
+
+
+def test_the_fixture_holds_both_scn_inj_max_populations():
+    """A fixture with one population cannot exercise the rule that splits them."""
+    rows = ec.read_table(MINI_DIR / "texas7k_SCN_INJ_MAX.csv").records()
+    scheduled = {r["Injector"] for r in rows}
+    assert scheduled == set(SCHEDULED_INJECTORS)
+    for injector in SCHEDULED_INJECTORS:
+        mine = [r for r in rows if r["Injector"] == injector]
+        assert {r["Scenario"] for r in mine} == {"0", "ScnRT"}
+        assert all(r["Schedule"] for r in mine)
+        assert all(r["MaxMw"] == "" for r in mine)
+    all_injectors = {r["Injector"] for r in
+                     ec.read_table(MINI_DIR / "texas7k_INJ_ID.csv").records()}
+    assert set(PLAIN_INJECTORS) <= all_injectors - scheduled
+    assert len(all_injectors - scheduled) >= 2
+
+
+def test_max_mw_on_a_scheduled_injector_is_refused(mini_base: Path,
+                                                   tmp_path: Path):
+    """Sequence > Schedule > static value, and the schedules cover every hour."""
+    injector = SCHEDULED_INJECTORS[0]
+    delta = ec.ScenarioOverride.of("SCN_INJ_MAX", "*", injector,
+                                   {"MaxMw": "100.000"})
+    with pytest.raises(ec.Ercot7kCaseError) as excinfo:
+        ec.write_layer(mini_base, tmp_path / "maxmw", [delta])
+    message = str(excinfo.value)
+    assert injector in message, "the error must name the injector"
+    assert "%s_fcst" % injector in message
+    assert "%s_act" % injector in message
+    assert "priority" in message
+
+
+def test_scale_factor_on_a_scheduled_injector_edits_both_rows(mini_base: Path,
+                                                              tmp_path: Path):
+    injector = SCHEDULED_INJECTORS[0]
+    other = SCHEDULED_INJECTORS[1]
+    layer = tmp_path / "scale"
+    manifest = ec.write_layer(
+        mini_base, layer,
+        [ec.ScenarioOverride.of("SCN_INJ_MAX", "*", injector,
+                                {"ScaleFactor": "0.800"})],
+        slug="scale")
+
+    parent_rows = ec.read_table(mini_base / "texas7k_SCN_INJ_MAX.csv").records()
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+
+    # Existing row ORDER is preserved. A reordering would show in V9 as every
+    # row changed and drown the two that were meant to.
+    assert [(r["Scenario"], r["Injector"]) for r in rows] == (
+        [(r["Scenario"], r["Injector"]) for r in parent_rows])
+
+    mine = [r for r in rows if r["Injector"] == injector]
+    assert len(mine) == 2
+    assert all(r["ScaleFactor"] == "0.800" for r in mine)
+    # Schedule is what ScaleFactor scales; it must be untouched.
+    assert [r["Schedule"] for r in mine] == ["%s_fcst" % injector,
+                                             "%s_act" % injector]
+    assert all(r["MaxMw"] == "" for r in mine)
+    assert all(r["ScaleFactor"] == "" for r in rows if r["Injector"] == other)
+
+    owned = {(e["table"], tuple(e["key"])) for e in manifest["owned"]}
+    assert ("SCN_INJ_MAX", ("0", injector)) in owned
+    assert ("SCN_INJ_MAX", ("ScnRT", injector)) in owned
+    assert not ec.has_errors(ec.verify_case(layer))
+
+
+def test_max_mw_on_an_unscheduled_injector_appends_one_default_row(
+        mini_base: Path, tmp_path: Path):
+    """One '0' row covers every scenario: none of them names this injector."""
+    injector = PLAIN_INJECTORS[0]
+    layer = tmp_path / "append"
+    ec.write_layer(mini_base, layer,
+                   [ec.ScenarioOverride.of("SCN_INJ_MAX", "0", injector,
+                                           {"MaxMw": "300.000"})],
+                   slug="append")
+
+    parent_rows = ec.read_table(mini_base / "texas7k_SCN_INJ_MAX.csv").records()
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+    assert len(rows) == len(parent_rows) + 1
+    # Appended at the END, with every inherited row still in its own place.
+    assert rows[:-1] == parent_rows
+    assert rows[-1]["Scenario"] == "0"
+    assert rows[-1]["Injector"] == injector
+    assert rows[-1]["MaxMw"] == "300.000"
+    assert rows[-1]["Schedule"] == ""
+    assert not ec.has_errors(ec.verify_case(layer))
+
+
+def test_the_all_rows_form_on_an_unscheduled_injector_is_refused(
+        mini_base: Path, tmp_path: Path):
+    delta = ec.ScenarioOverride.of("SCN_INJ_MAX", "*", PLAIN_INJECTORS[0],
+                                   {"MaxMw": "300.000"})
+    with pytest.raises(ec.Ercot7kCaseError, match="nothing for the"):
+        ec.write_layer(mini_base, tmp_path / "star", [delta])
+
+
+def test_a_named_scenario_on_an_unscheduled_injector_is_refused(
+        mini_base: Path, tmp_path: Path):
+    """A single named scenario would leave the other two uncapped."""
+    delta = ec.ScenarioOverride.of("SCN_INJ_MAX", "ScnRT", PLAIN_INJECTORS[0],
+                                   {"MaxMw": "300.000"})
+    with pytest.raises(ec.Ercot7kCaseError, match="uncapped"):
+        ec.write_layer(mini_base, tmp_path / "named", [delta])
+
+
+def test_max_mw_above_the_inj_id_ceiling_is_refused(mini_base: Path,
+                                                    tmp_path: Path):
+    """SCN_INJ_MAX can only restrict; above the ceiling the run is capped."""
+    delta = ec.ScenarioOverride.of("SCN_INJ_MAX", "0", PLAIN_INJECTORS[0],
+                                   {"MaxMw": "9000.000"})
+    with pytest.raises(ec.Ercot7kCaseError, match="silently capped"):
+        ec.write_layer(mini_base, tmp_path / "ceiling", [delta])
+
+
+def test_max_mw_below_min_dispatch_is_refused(mini_base: Path, tmp_path: Path):
+    """VERIFIED: the limit cannot be more restrictive than INJ_CMT.MinDispatch."""
+    delta = ec.ScenarioOverride.of("SCN_INJ_MAX", "0", PLAIN_INJECTORS[0],
+                                   {"MaxMw": "10.000"})
+    with pytest.raises(ec.Ercot7kCaseError, match="MinDispatch"):
+        ec.write_layer(mini_base, tmp_path / "mindisp", [delta])
+
+
+def test_a_byog_below_its_ceiling_gets_a_scn_inj_max_row(mini_base: Path,
+                                                         tmp_path: Path):
+    """byog_max_mw is the study ceiling; byog_p_nom is the capacity this run."""
+    layer = tmp_path / "byog"
+    manifest = ec.build_datacenter_layer(
+        mini_base, layer, mini_spec(byog_p_nom_mw=25.0, byog_max_mw=50.0))
+
+    injectors = {r["Injector"]: r for r in
+                 ec.read_table(layer / "texas7k_INJ_ID.csv").records()}
+    assert injectors["DC1_BYOG"]["MaxMw"] == "50.000"
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+    added = [r for r in rows if r["Injector"] == "DC1_BYOG"]
+    assert len(added) == 1
+    assert added[0]["Scenario"] == "0"
+    assert added[0]["MaxMw"] == "25.000"
+    assert manifest["capacity_ceilings"]["DC1_BYOG"] == 50.0
+    findings = ec.verify_case(layer)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+    assert "V11" in {f.check for f in findings if f.level == ec.LEVEL_OK}
+
+
+def test_an_equal_byog_writes_no_scn_inj_max_row(mini_base: Path,
+                                                 tmp_path: Path):
+    """A row restating INJ_ID.MaxMw is a line of diff carrying no information."""
+    layer = tmp_path / "byog"
+    ec.build_datacenter_layer(mini_base, layer, mini_spec())
+    assert (layer / "texas7k_SCN_INJ_MAX.csv").read_bytes() == (
+        (mini_base / "texas7k_SCN_INJ_MAX.csv").read_bytes())
+
+
+def test_a_hand_raised_scn_inj_max_is_caught_by_v11(mini_base: Path,
+                                                    tmp_path: Path):
+    layer = tmp_path / "byog"
+    ec.build_datacenter_layer(
+        mini_base, layer, mini_spec(byog_p_nom_mw=25.0, byog_max_mw=50.0))
+    target = layer / "texas7k_SCN_INJ_MAX.csv"
+    target.write_bytes(target.read_bytes().replace(b"25.000", b"99.000"))
+    findings = ec.verify_case(layer)
+    v11 = [f for f in findings
+           if f.check == "V11" and f.level == ec.LEVEL_ERROR]
+    assert v11, ec.format_findings(findings)
+
+
+# ------------------------------------------------------------------------------
+#   9. stress_deltas() -- the lever expander
+#
+#   An unrecognised lever or mode is a HARD ERROR naming what is implemented. A
+#   skipped row is the exact failure this component exists to prevent: the sweep
+#   runs, the numbers move a little for unrelated reasons, and the lever the
+#   study rests on was never applied.
+# ------------------------------------------------------------------------------
+def stress_row(**overrides) -> dict:
+    row = {"lever": "k_load", "target": "", "mode": "scale", "value": "1.20"}
+    row.update(overrides)
+    return row
+
+
+def test_k_load_expands_to_one_all_rows_override():
+    tables = ec.read_case(MINI_DIR)
+    deltas = ec.stress_deltas([stress_row()], tables)
+    assert len(deltas) == 1
+    delta = deltas[0]
+    assert isinstance(delta, ec.ScenarioOverride)
+    assert delta.table == "SCN_ARA_LOD"
+    assert delta.scenario == "*"
+    assert delta.field_map() == {"ScaleFactor": "1.200"}
+
+
+def test_an_unknown_lever_is_refused_and_names_the_implemented_set():
+    tables = ec.read_case(MINI_DIR)
+    with pytest.raises(ec.Ercot7kCaseError) as excinfo:
+        ec.stress_deltas([stress_row(lever="k_line", value="0.90")], tables)
+    message = str(excinfo.value)
+    assert "k_line" in message
+    for lever in ec.STRESS_LEVERS:
+        assert lever in message, "the error must name what IS implemented"
+    assert "STRESS_LEVERS" in message
+
+
+def test_an_unknown_mode_is_refused():
+    tables = ec.read_case(MINI_DIR)
+    with pytest.raises(ec.Ercot7kCaseError, match="mode"):
+        ec.stress_deltas([stress_row(mode="add")], tables)
+
+
+def test_a_targeted_k_load_is_refused():
+    """Per-bus and per-area k_load are out of scope, not silently system-wide."""
+    tables = ec.read_case(MINI_DIR)
+    with pytest.raises(ec.Ercot7kCaseError, match="blank target"):
+        ec.stress_deltas([stress_row(target="N111179")], tables)
+
+
+def test_a_blank_lever_row_is_refused_rather_than_skipped():
+    tables = ec.read_case(MINI_DIR)
+    with pytest.raises(ec.Ercot7kCaseError, match="row to skip"):
+        ec.stress_deltas([stress_row(lever="")], tables)
+
+
+def test_a_non_numeric_or_zero_k_load_is_refused():
+    tables = ec.read_case(MINI_DIR)
+    with pytest.raises(ec.Ercot7kCaseError, match="not a number"):
+        ec.stress_deltas([stress_row(value="a lot")], tables)
+    with pytest.raises(ec.Ercot7kCaseError, match="untouched"):
+        ec.stress_deltas([stress_row(value="0")], tables)
+
+
+def test_a_stress_layer_that_expands_to_nothing_is_refused(mini_base: Path,
+                                                           tmp_path: Path):
+    with pytest.raises(ec.Ercot7kCaseError, match="byte-identical copy"):
+        ec.build_stress_layer(mini_base, tmp_path / "empty", [])
+
+
+# ------------------------------------------------------------------------------
+#   10. A two-layer chain end to end: datacenter, then k_load on top
+# ------------------------------------------------------------------------------
+def test_a_datacenter_then_a_k_load_layer_verify_clean(mini_base: Path,
+                                                       tmp_path: Path):
+    dc_layer = tmp_path / ec.layer_dir_name(mini_base, "dc1")
+    ec.build_datacenter_layer(mini_base, dc_layer,
+                              mini_spec(byog_p_nom_mw=25.0, byog_max_mw=50.0))
+    findings = ec.verify_case(dc_layer)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+
+    stress_layer = tmp_path / ec.layer_dir_name(dc_layer, "k_load1p20")
+    manifest = ec.build_stress_layer(dc_layer, stress_layer,
+                                     [stress_row()], slug="k_load1p20")
+    findings = ec.verify_case(stress_layer)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+
+    chain = ec.walk_chain(stress_layer)
+    assert [c.kind for c in chain] == ["base", "layer", "layer"]
+    # The stress layer inherits the datacenter's ceiling and the datacenter rows.
+    assert ec.chain_capacity_ceilings(chain)["DC1_BYOG"] == 50.0
+    assert manifest["study"]["stress"][0]["lever"] == "k_load"
+
+    rows = ec.read_table(stress_layer / "texas7k_SCN_ARA_LOD.csv").records()
+    assert all(r["ScaleFactor"] == "1.200" for r in rows)
+    dsp = ec.read_table(stress_layer / "texas7k_SCN_INJ_DSP.csv").records()
+    assert len(dsp) == 3, "the datacenter pin survives the layer above it"
+    inj_max = ec.read_table(stress_layer / "texas7k_SCN_INJ_MAX.csv").records()
+    assert [r for r in inj_max if r["Injector"] == "DC1_BYOG"]
+
+
+def test_two_k_load_layers_each_declare_the_value_they_replace(
+        mini_base: Path, tmp_path: Path):
+    """Adds are exclusive; edits are allowed but must declare their prior value."""
+    first = tmp_path / "k1"
+    ec.write_layer(mini_base, first, [k_load("1.200")], slug="k1")
+    second = tmp_path / "k2"
+    manifest = ec.write_layer(first, second, [k_load("1.400")], slug="k2")
+
+    prior = [e["prior_values"] for e in manifest["owned"]
+             if e["table"] == "SCN_ARA_LOD"]
+    assert prior == [{"ScaleFactor": "1.200"}, {"ScaleFactor": "1.200"}]
+    rows = ec.read_table(second / "texas7k_SCN_ARA_LOD.csv").records()
+    assert all(r["ScaleFactor"] == "1.400" for r in rows), (
+        "the second factor replaces the first; it does not compound")
+    assert not ec.has_errors(ec.verify_case(second))
