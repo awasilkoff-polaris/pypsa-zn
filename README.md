@@ -422,9 +422,27 @@ Run:
 python devnet_pub_figs.py
 ```
 
-or select the publication-figure option from `devnet_menu.py`.
+or select the publication-figure option from `devnet_menu.py`. The workflow is driven by `devnet-stress-vectors/devnetDC_sysdsg.xlsx`.
 
-The workflow is driven by `devnet-stress-vectors/devnetDC_sysdsg.xlsx`:
+### Experiment Design Workbook
+
+`devnetDC_sysdsg.xlsx` is the primary researcher-facing workbook for defining
+DevNetDC experiments and publication artifacts. It is maintained under:
+
+```text
+./devnet-stress-vectors/devnetDC_sysdsg.xlsx
+````
+
+The workbook contains a **`UsageGuide`** worksheet documenting its structure,
+configuration conventions, Scenario activation rules, Event definitions,
+Commit-ID mapping, Event Driver conventions, and Figure/Table artifact generation.
+
+Researchers extending the experiment set should review the `UsageGuide` sheet
+before adding or modifying Scenarios, Events, or publication artifacts.
+
+Refer:
+
+[UsageGuide — `devnetDC_sysdsg.xlsx`](./devnet-stress-vectors/devnetDC_sysdsg.xlsx)
 
 ``` text
 Scenario
