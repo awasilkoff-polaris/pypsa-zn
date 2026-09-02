@@ -180,6 +180,12 @@ def print_header():
         "  Notes:\n"
         "   - (6), (7), and (8) expect the stress workbook/report inputs to exist.\n"
         "   - If plots fail due to missing workbook/sheet, run option (5) first.\n"
+        "\n"
+        "PSO (separate track):\n"
+        "  12) Run the ERCOT Texas7k full-cycle case through PSO (ercot7k_pso.py)\n"
+        "     - PSO-only: 6717-bus public case, driven via aimmspy against your own\n"
+        "       AIMMS install/license. Does not build or touch a PyPSA network.\n"
+        "     - Configure via pso.local.toml first (see pso.local.toml.example).\n"
         "\n(Analysis module will be added later.)\n"
     )
 
@@ -200,6 +206,7 @@ def print_menu():
     print("  9) Plot: DevNet 8760 objective/load/feasibility (devnet_sys_plot.py)")
     print(" 10) Plot: PJM_NE 8760 LMP chronology (devnet_pjm_ne_lmp_plot.py)")
     print(" 11) Plot: Journal publication figures (devnet_pub_figs.py)")
+    print(" 12) Run ERCOT Texas7k PSO full-cycle case (ercot7k_pso.py)")
     print("  0) Exit")
 
 # ------------------------------------------------------------------------------
@@ -250,6 +257,9 @@ def main():
         elif choice == "11":
             rc = run_script("devnet_pub_figs.py")
             input(f"\nFinished devnet_pub_figs.py (exit code {rc}). Press Enter to return to menu...")
+        elif choice == "12":
+            rc = run_script("ercot7k_pso.py")
+            input(f"\nFinished ercot7k_pso.py (exit code {rc}). Press Enter to return to menu...")
         elif choice == "0":
             print("\nExiting devnet_menu.py\n")
             return 0

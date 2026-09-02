@@ -108,6 +108,11 @@ pypsa-zn/
 ├── devnet_pub_figs.py
 ├── devnet_callstack.md
 │
+├── ercot7k_pso.py
+├── pso_config.py
+├── pso.local.toml.example
+├── ercot7k/
+│
 ├── lib/
 │   ├── devnet_stress_lib.py
 │   └── devnet_stress_frame.html
@@ -476,6 +481,63 @@ Event Driver convention:
 -   Datacenter mitigation/support actions → **blue**.
 
 Generated publication artifacts are written to `./pub_figs/`.
+
+------------------------------------------------------------------------
+
+## ERCOT Texas7k PSO Full-Cycle Case (PSO-only track)
+
+A separate, PSO-only track lets you run the public **ERCOT Texas7k** case
+(6717 buses, 9140 branches, 634 injectors) full-cycle through PSO, driven
+from Python via `aimmspy` and your own AIMMS install/license. It does not
+build or touch a PyPSA network, and it does not modify `lib/devnet_stress_lib.py`
+or `devnet_stress.py` -- it is a sibling to `devnetDC_sld.py`, not a
+replacement.
+
+``` text
+ercot7k/                 Texas7k PSO input tables
+pso_config.py            pso.local.toml -> DEVNET_PSO_* env defaults
+pso.local.toml.example   copy to pso.local.toml and edit
+ercot7k_pso.py           the runner (option 12 in devnet_menu.py)
+```
+
+### Prerequisites
+
+- An AIMMS install (26.1.x tested) with the `aimmspy` Python package, and a
+  license -- an academic/cloud license (`license_url`) works fine.
+- A local checkout of the PSO model project (`PSO.aimms`), matching the AIMMS
+  version above. This is not part of this repo; point `pso.local.toml` at it.
+- **A separate Python environment for `aimmspy`.** It cannot share an
+  environment with PyPSA: its dependencies force `linopy` down and break
+  PyPSA's `n.optimize`. Set `python` in `pso.local.toml` to that interpreter
+  and `ercot7k_pso.py` re-launches itself there, which is what makes the menu
+  entry work (the menu runs scripts with its own interpreter).
+
+### Setup
+
+Copy `pso.local.toml.example` to `pso.local.toml` (repo root, gitignored)
+and fill in at least `project` (path to your `PSO.aimms`). Leave
+`license_url` commented out to use the machine's configured license, or set
+it for an academic/cloud license. `case` defaults to
+`ercot7k/texas7k.csv` if left unset.
+
+### Running it
+
+``` bash
+python ercot7k_pso.py
+```
+
+or select option 12 from `python devnet_menu.py`. The script prompts for a
+run name, prints a pre-flight summary (case, project, horizon, cycle
+stack), gates on confirmation before solving, and verifies the result by
+reading peak served load out of `results_ED_Ara.csv` -- never the return
+code alone. See `ercot7k/README.md` for the case details (horizon, cycle
+stack, expected solve time and result size).
+
+### Attribution
+
+The Texas7k dataset carries its own attribution requirements (TAMU
+registration/citation, CC-BY sources). See `ercot7k/README.md`; the full
+field-level provenance record follows in a separate change.
 
 ------------------------------------------------------------------------
 
