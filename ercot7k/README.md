@@ -30,6 +30,40 @@ meant to be solved locally, not shipped with pre-solved output.
   the run's own results directory. Peak served load on the RT cycle is
   ~46,795 MW (this is a spring week; do not expect a summer-peak figure).
 
+## Data vintage - read this before interpreting results
+
+This is an **illustrative synthetic blend, not a replay of any single year**:
+
+- grid topology and generation fleet: roughly 2021
+- offer economics: derived from roughly 2021 ERCOT SCED data
+- load and renewable profiles: **2018** ARPA-E PERFORM weather/load series
+
+So the hours are 2018 weather driving a 2021 fleet at 2021 offer prices. It is
+built for demonstration and training, and it is not a hindcast.
+
+## Known issues
+
+- **Negative offers.** `San Miguel 1` offers at about -$249/MWh, and 468
+  injector-rows carry a negative `CostTotal`. This is the first thing a
+  power-markets reader tends to find in an LMP plot, so it is called out here
+  rather than left to be discovered. A fix is in progress upstream; until then,
+  treat the low tail of the price surface with suspicion.
+
+## Known-good baseline
+
+A clean run of this case should reproduce:
+
+| Check | Value |
+|---|---|
+| Solves | 190, all `Optimal` (`results_MC_Solution.csv`) |
+| RT cycle cost | about $12.0M for the week (`results_MC_Hrzn.csv`, `DeltaCost` summed over `cyc=RT`) |
+| Peak RT area load | 46,794.5 MW at interval 184 (`results_ED_Ara.csv`) |
+
+If your numbers differ materially, something in the run is wrong before any
+interpretation is worth doing. Note `ED_Ara.Load` is fixed input load and does
+not fall when load is shed, so it confirms the case was read - not that it was
+served.
+
 ## Running it
 
 See `../ercot7k_pso.py` at the repo root, and its `Prerequisites` / `Setup`

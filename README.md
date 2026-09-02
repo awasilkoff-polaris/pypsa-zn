@@ -500,25 +500,20 @@ pso.local.toml.example   copy to pso.local.toml and edit
 ercot7k_pso.py           the runner (option 3 -> PSO route, in devnet_menu.py)
 ```
 
-### Prerequisites
-
-- An AIMMS install (26.1.x tested) with the `aimmspy` Python package, and a
-  license -- an academic/cloud license (`license_url`) works fine.
-- A local checkout of the PSO model project (`PSO.aimms`), matching the AIMMS
-  version above. This is not part of this repo; point `pso.local.toml` at it.
-- **A separate Python environment for `aimmspy`.** It cannot share an
-  environment with PyPSA: its dependencies force `linopy` down and break
-  PyPSA's `n.optimize`. Set `python` in `pso.local.toml` to that interpreter
-  and `ercot7k_pso.py` re-launches itself there, which is what makes the menu
-  entry work (the menu runs scripts with its own interpreter).
-
 ### Setup
 
-Copy `pso.local.toml.example` to `pso.local.toml` (repo root, gitignored)
-and fill in at least `project` (path to your `PSO.aimms`). Leave
-`license_url` commented out to use the machine's configured license, or set
-it for an academic/cloud license. `case` defaults to
-`ercot7k/texas7k.csv` if left unset.
+You need an AIMMS install (26.1.x tested) with a license -- the free academic
+license works -- and a checkout of the PSO model project (`PSO.aimms`), which
+is not part of this repo.
+
+`aimmspy` needs **its own Python environment**: its dependencies force `linopy`
+down and break PyPSA's `n.optimize`, so it cannot share the PyPSA env. Set
+`python` in `pso.local.toml` to that interpreter and the runner re-launches
+itself there, which is what makes the menu entry work.
+
+Copy `pso.local.toml.example` to `pso.local.toml` (repo root, gitignored) and
+fill in at least `project`. Leave `license_url` commented out to use the
+machine's configured license; `case` defaults to `ercot7k/texas7k.csv`.
 
 ### Running it
 
@@ -526,20 +521,12 @@ it for an academic/cloud license. `case` defaults to
 python ercot7k_pso.py
 ```
 
-or, from `python devnet_menu.py`, select option 3 (Datacenter case), then the
-PSO route, then the base case. The same option 3 reaches the PyPSA DevNet
-6-bus build, so the two engine routes sit side by side. The script prompts for a
-run name, prints a pre-flight summary (case, project, horizon, cycle
-stack), gates on confirmation before solving, and verifies the result by
-reading peak served load out of `results_ED_Ara.csv` -- never the return
-code alone. See `ercot7k/README.md` for the case details (horizon, cycle
-stack, expected solve time and result size).
-
-### Attribution
-
-The Texas7k dataset carries its own attribution requirements (TAMU
-registration/citation, CC-BY sources). See `ercot7k/README.md`; the full
-field-level provenance record follows in a separate change.
+or from `python devnet_menu.py`, option 3 (Datacenter case) -> PSO route ->
+base case; the same option 3 reaches the PyPSA DevNet build, so the two engine
+routes sit side by side. The runner prompts for a run name, prints a pre-flight
+summary, gates on confirmation, and verifies the result out of
+`results_ED_Ara.csv` rather than trusting the return code. Case details,
+attribution and known data caveats are in `ercot7k/README.md`.
 
 ------------------------------------------------------------------------
 

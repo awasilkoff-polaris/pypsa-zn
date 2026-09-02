@@ -211,51 +211,36 @@ def print_menu():
 
 # ------------------------------------------------------------------------------
 # pick_submenu()
-# Prompts for one of a numbered list of choices and returns the 1-based index,
-# or 0 if the user backs out.
-#
-# Used by the option 3 engine-route prompts. Keeps the same rhythm as the main
-# menu: numbered lines, a bare Enter takes the default, anything invalid
-# re-asks rather than guessing.
+# Prompts for one of a numbered list of choices; returns the 1-based index, or
+# 0 to go back. Re-asks on anything invalid; a bare Enter takes the default.
 # ------------------------------------------------------------------------------
 def pick_submenu(title: str, choices: list[str], default: int = 1) -> int:
-    print(f"\n{title}")
+    while True:
+        print(f"\n{title}")
 
-    for i, label in enumerate(choices, start=1):
-        print(f"  {i}) {label}")
+        for i, label in enumerate(choices, start=1):
+            print(f"  {i}) {label}")
 
-    print("  0) Back to main menu")
+        print("  0) Back to main menu")
 
-    raw = input(f"\nEnter choice [{default}]: ").strip()
+        raw = input(f"\nEnter choice [{default}]: ").strip()
 
-    if not raw:
-        return default
+        if not raw:
+            return default
 
-    if raw == "0":
-        return 0
+        if raw.isdigit() and int(raw) <= len(choices):
+            return int(raw)
 
-    try:
-        picked = int(raw)
-    except ValueError:
         print("\nInvalid choice.")
-        return -1
-
-    if 1 <= picked <= len(choices):
-        return picked
-
-    print("\nInvalid choice.")
-    return -1
 
 # ------------------------------------------------------------------------------
 # run_datacenter_case()
-# Option 3: choose the engine route for a datacenter case, then dispatch.
+# Option 3: pick the engine route for a datacenter case, then dispatch.
 #
 # PyPSA route -> devnetDC_sld.py, the 6-bus DevNet SLD with Datacenter BYOG.
-# PSO route   -> the ERCOT Texas7k public case through PSO (ercot7k_pso.py).
-#
-# The PSO route is PSO-only: no PyPSA network is built. The stress matrix is
-# not part of this branch yet and reports itself as unavailable rather than
-# being hidden, so the intended shape is visible.
+# PSO route   -> the ERCOT Texas7k public case (ercot7k_pso.py). PSO-only: no
+#                PyPSA network is built. The stress matrix is not part of this
+#                build and says so rather than being hidden.
 # ------------------------------------------------------------------------------
 def run_datacenter_case() -> None:
     route = pick_submenu(
@@ -266,14 +251,12 @@ def run_datacenter_case() -> None:
         ],
     )
 
-    if route <= 0:
-        if route < 0:
-            input("\nPress Enter to return to menu...")
-        return
-
     if route == 1:
         rc = run_script("devnetDC_sld.py")
         input(f"\nFinished devnetDC_sld.py (exit code {rc}). Press Enter to return to menu...")
+        return
+
+    if route != 2:
         return
 
     what = pick_submenu(
@@ -284,20 +267,13 @@ def run_datacenter_case() -> None:
         ],
     )
 
-    if what <= 0:
-        if what < 0:
-            input("\nPress Enter to return to menu...")
-        return
-
     if what == 1:
         rc = run_script("ercot7k_pso.py")
         input(f"\nFinished ercot7k_pso.py (exit code {rc}). Press Enter to return to menu...")
-        return
-
-    print("\nASR-DBG: The Texas7k stress matrix is not part of this build.")
-    print("It arrives with the case-builder / stress-vector work; until then use")
-    print("the base case above.\n")
-    input("Press Enter to return to menu...")
+    elif what == 2:
+        print("\nASR-DBG: The Texas7k stress matrix is not part of this build.")
+        print("It arrives with the case-builder work; until then use the base case.\n")
+        input("Press Enter to return to menu...")
 
 # ------------------------------------------------------------------------------
 # main()
