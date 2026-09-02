@@ -497,7 +497,7 @@ replacement.
 ercot7k/                 Texas7k PSO input tables
 pso_config.py            pso.local.toml -> DEVNET_PSO_* env defaults
 pso.local.toml.example   copy to pso.local.toml and edit
-ercot7k_pso.py           the runner (option 12 in devnet_menu.py)
+ercot7k_pso.py           the runner (option 3 -> PSO route, in devnet_menu.py)
 ```
 
 ### Prerequisites
@@ -526,7 +526,9 @@ it for an academic/cloud license. `case` defaults to
 python ercot7k_pso.py
 ```
 
-or select option 12 from `python devnet_menu.py`. The script prompts for a
+or, from `python devnet_menu.py`, select option 3 (Datacenter case), then the
+PSO route, then the base case. The same option 3 reaches the PyPSA DevNet
+6-bus build, so the two engine routes sit side by side. The script prompts for a
 run name, prints a pre-flight summary (case, project, horizon, cycle
 stack), gates on confirmation before solving, and verifies the result by
 reading peak served load out of `results_ED_Ara.csv` -- never the return
