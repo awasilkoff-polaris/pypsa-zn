@@ -147,15 +147,52 @@ def peak_served_load(results_dir: str, cycle: str = "") -> float | None:
 
 # ------------------------------------------------------------------------------
 # read_mc_solution()
-# Reads Objective / Status out of results_MC_Solution.csv, if present.
+# Summarises the solve: how many solves ran, and their Status breakdown.
+#
+# Deliberately does NOT report results_MC_Solution.csv's Objective column. That
+# file holds one row per solve -- 190 of them on the shipped case -- so the
+# first row is one horizon of one cycle, not the cost of the run. Printing it
+# next to the word "Objective" invites reading a single horizon as the whole
+# week. Cycle costs come from summarise_cycle_cost() instead.
 # ------------------------------------------------------------------------------
-def read_mc_solution(results_dir: str) -> dict | None:
+def summarise_solves(results_dir: str) -> dict | None:
     path = os.path.join(results_dir, "results_MC_Solution.csv")
     if not os.path.isfile(path):
         return None
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        row = next(csv.DictReader(f), None)
-    return row
+
+    status: dict[str, int] = {}
+
+    with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+        for row in csv.DictReader(f):
+            key = (row.get("Status") or "").strip() or "(blank)"
+            status[key] = status.get(key, 0) + 1
+
+    return {"solves": sum(status.values()), "status": status}
+
+# ------------------------------------------------------------------------------
+# summarise_cycle_cost()
+# Sums results_MC_Hrzn.csv DeltaCost per cycle.
+#
+# DeltaCost is the cost of the periods inside a horizon's DeltaTime, i.e. the
+# non-overlapping slice. Summing it is meaningful where summing per-solve
+# objectives is not, because SC and DA horizons overlap their look-ahead.
+# ------------------------------------------------------------------------------
+def summarise_cycle_cost(results_dir: str) -> dict[str, float]:
+    path = os.path.join(results_dir, "results_MC_Hrzn.csv")
+    if not os.path.isfile(path):
+        return {}
+
+    totals: dict[str, float] = {}
+
+    with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        cyc_field = (reader.fieldnames or [""])[0]
+
+        for row in reader:
+            cyc = (row.get(cyc_field) or "").strip()
+            totals[cyc] = totals.get(cyc, 0.0) + float(row.get("DeltaCost", 0.0) or 0.0)
+
+    return totals
 
 # ------------------------------------------------------------------------------
 # print_pso_error_logs()
@@ -481,12 +518,22 @@ for f in result_files:
 print(f"\n\t{len(result_files)} file(s), "
       f"{sum(f.stat().st_size for f in result_files) / (1024*1024):,.1f} MB total\n")
 
-mc = read_mc_solution(RESULTS_PATH)
-if mc:
-    print(f"ASR-DBG::results_MC_Solution.csv::\n\tObjective = {mc.get('Objective')}"
-          f"\n\tStatus    = {mc.get('Status')}\n")
+solves = summarise_solves(RESULTS_PATH)
+if solves:
+    breakdown = ", ".join(f"{n} {s}" for s, n in sorted(solves["status"].items()))
+    print(f"ASR-DBG::Solves (results_MC_Solution.csv)::\n"
+          f"\t{solves['solves']} solve(s): {breakdown}\n")
 else:
-    print("ASR-DBG: results_MC_Solution.csv not found (no objective/status to report).\n")
+    print("ASR-DBG: results_MC_Solution.csv not found (no solve summary to report).\n")
+
+costs = summarise_cycle_cost(RESULTS_PATH)
+if costs:
+    print("ASR-DBG::Cost by cycle (results_MC_Hrzn.csv, DeltaCost)::\n")
+    for cyc in sorted(costs):
+        print(f"\t{cyc:8s} {costs[cyc]:20,.3f}")
+    print()
+else:
+    print("ASR-DBG: results_MC_Hrzn.csv not found (no cycle costs to report).\n")
 
 print(SECTION_SEPARATOR)
 if run_failed:
