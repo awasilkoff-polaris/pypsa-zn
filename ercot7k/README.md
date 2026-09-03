@@ -53,16 +53,28 @@ built for demonstration and training, and it is not a hindcast.
 
 A clean run of this case should reproduce:
 
-| Check | Value |
-|---|---|
-| Solves | 190, all `Optimal` (`results_MC_Solution.csv`) |
-| RT cycle cost | about $12.0M for the week (`results_MC_Hrzn.csv`, `DeltaCost` summed over `cyc=RT`) |
-| Peak RT area load | 46,794.5 MW at interval 184 (`results_ED_Ara.csv`) |
+| Check | Value | Reproducible? |
+|---|---|---|
+| Solves | 190, all `Optimal` (`results_MC_Solution.csv`) | exactly |
+| Peak RT area load | 46,794.5 MW at interval 184 (`results_ED_Ara.csv`) | exactly |
+| SC cycle cost | 11,727,676.8 (`results_MC_Hrzn.csv`, `DeltaCost` summed over `cyc=SC`) | exactly |
+| DA cycle cost | about 20.3M | within the MIP gap |
+| RT cycle cost | about 12.0M | within the MIP gap |
 
-If your numbers differ materially, something in the run is wrong before any
-interpretation is worth doing. Note `ED_Ara.Load` is fixed input load and does
-not fall when load is shed, so it confirms the case was read - not that it was
-served.
+**Do not expect the DA and RT costs to match to the digit across builds.** DA
+carries about 10,700 integer variables and is solved to `MipGap` 0.005, so a
+different PSO build or solver version lands on a different incumbent inside
+that gap - the runs above differ by 0.4%. RT is an LP but inherits DA's
+commitment through the cycle chain, so it carries the same variation (0.8%
+observed). SC is an LP with nothing upstream, which is why it is bit-exact and
+is the better regression check of the three.
+
+If the solve count, the optimal status or the peak load differ at all, or the
+costs move by more than about 1%, something is wrong with the run and no
+interpretation is worth doing yet.
+
+Note `ED_Ara.Load` is fixed input load and does not fall when load is shed, so
+it confirms the case was read - not that it was served.
 
 ## Running it
 
