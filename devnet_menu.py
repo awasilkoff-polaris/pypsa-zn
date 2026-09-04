@@ -271,7 +271,7 @@ def run_datacenter_case() -> None:
         rc = run_script("ercot7k_pso.py")
         input(f"\nFinished ercot7k_pso.py (exit code {rc}). Press Enter to return to menu...")
     elif what == 2:
-        print("\nASR-DBG: The Texas7k stress matrix is not part of this build.")
+        print("\nAMW-DBG: The Texas7k stress matrix is not part of this build.")
         print("It arrives with the case-builder work; until then use the base case.\n")
         input("Press Enter to return to menu...")
 

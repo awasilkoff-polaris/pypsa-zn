@@ -231,14 +231,14 @@ def print_pso_error_logs(project_path: str, err_offset: int = 0,
             new_text = f.read()
 
         if new_text.strip():
-            print(f"ASR-ERR: {err_path}, this run only:\n")
+            print(f"AMW-ERR: {err_path}, this run only:\n")
             print(new_text)
         else:
-            print(f"ASR-ERR: {err_path} gained nothing during this run.")
+            print(f"AMW-ERR: {err_path} gained nothing during this run.")
             print("AIMMS appends to that file, so anything already in it is from")
             print("earlier runs and is not this failure.")
     else:
-        print(f"ASR-ERR: no aimms.err found at {err_path}")
+        print(f"AMW-ERR: no aimms.err found at {err_path}")
 
     # Only a debuglog this run actually wrote. The newest file in that
     # directory may belong to an entirely different case, and its tail then
@@ -248,14 +248,14 @@ def print_pso_error_logs(project_path: str, err_offset: int = 0,
 
     if debuglogs:
         latest = debuglogs[-1]
-        print(f"\nASR-ERR: tail of {latest}:\n")
+        print(f"\nAMW-ERR: tail of {latest}:\n")
         with open(latest, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         for line in lines[-60:]:
             print(line, end="")
         print()
     else:
-        print(f"\nASR-ERR: this run wrote no debuglog_*.txt in {log_dir}")
+        print(f"\nAMW-ERR: this run wrote no debuglog_*.txt in {log_dir}")
         print("(any older debuglog there belongs to a previous run, so it is not shown)")
     print(SUBSECTION_SEPARATOR)
 
@@ -268,7 +268,7 @@ try:
     import pso_config
     pso_config.load_config()
 except Exception as e:
-    print(f"ASR-DBG: pso_config.load_config() failed ({e}); continuing on plain env vars.")
+    print(f"AMW-DBG: pso_config.load_config() failed ({e}); continuing on plain env vars.")
 
 # ------------------------------------------------------------------------------
 #   Resolve config (env-only from here -- config-error path must not require
@@ -281,7 +281,7 @@ AIMMS_VERSION = os.environ.get("DEVNET_PSO_AIMMS_VERSION")
 LICENSE_URL = os.environ.get("DEVNET_PSO_LICENSE_URL")
 
 if not PROJECT:
-    print("ASR-ERR: DEVNET_PSO_PROJECT is not set (path to PSO.aimms).")
+    print("AMW-ERR: DEVNET_PSO_PROJECT is not set (path to PSO.aimms).")
     print("Copy pso.local.toml.example -> pso.local.toml at the repo root and set 'project',")
     print("or set the DEVNET_PSO_PROJECT environment variable directly.")
     sys.exit(1)
@@ -290,9 +290,9 @@ if not os.path.isabs(CASE):
     CASE = os.path.join(SCRIPT_DIR, CASE)
 
 if not os.path.isfile(CASE):
-    sys.exit(f"ASR-ERR: case file not found: {CASE}")
+    sys.exit(f"AMW-ERR: case file not found: {CASE}")
 if not os.path.isfile(PROJECT):
-    sys.exit(f"ASR-ERR: PSO project not found: {PROJECT} (set DEVNET_PSO_PROJECT)")
+    sys.exit(f"AMW-ERR: PSO project not found: {PROJECT} (set DEVNET_PSO_PROJECT)")
 
 # Normalize BEFORE anything is handed to aimmspy -- see native_path().
 PROJECT = native_path(PROJECT)
@@ -329,12 +329,12 @@ except Exception:
 
 if not _has_aimmspy:
     if SOLVE_PYTHON and os.path.isfile(SOLVE_PYTHON) and not os.environ.get("DEVNET_PSO_RELAUNCHED"):
-        print("ASR-DBG: aimmspy not in this interpreter; re-launching under:")
+        print("AMW-DBG: aimmspy not in this interpreter; re-launching under:")
         print(f"\t{SOLVE_PYTHON}\n")
         os.environ["DEVNET_PSO_RELAUNCHED"] = "1"
         sys.exit(subprocess.call([SOLVE_PYTHON, os.path.abspath(__file__)] + sys.argv[1:]))
 
-    print("ASR-ERR: aimmspy is not available in this interpreter:")
+    print("AMW-ERR: aimmspy is not available in this interpreter:")
     print(f"\t{sys.executable}\n")
     print("aimmspy ships with AIMMS and cannot share an environment with PyPSA.")
     print("Set 'python' in pso.local.toml (or DEVNET_PSO_PYTHON) to the interpreter")
@@ -350,10 +350,10 @@ RUN_NAME = user_input if user_input else default_run
 
 # Keep run output out of the tracked case directory and out of nested paths.
 if os.sep in RUN_NAME or "/" in RUN_NAME or RUN_NAME == os.path.dirname(DEFAULT_CASE):
-    sys.exit(f"ASR-ERR: invalid run name '{RUN_NAME}' -- use a plain name, "
+    sys.exit(f"AMW-ERR: invalid run name '{RUN_NAME}' -- use a plain name, "
              f"not a path and not '{os.path.dirname(DEFAULT_CASE)}' (the case directory).")
 
-print(f"ASR-DBG::Using RUN_NAME::\n\t{RUN_NAME}\n")
+print(f"AMW-DBG::Using RUN_NAME::\n\t{RUN_NAME}\n")
 
 RUN_PATH = os.path.join(SCRIPT_DIR, RUN_NAME)
 LOG_PATH = os.path.join(RUN_PATH, "logs")
@@ -414,7 +414,7 @@ print(f"Saving logs to: {LOG_NAME}")
 #   Pre-flight summary (reads CSVs directly -- no AIMMS needed for this part)
 # ------------------------------------------------------------------------------
 print(SECTION_SEPARATOR)
-print("ASR-DBG::Pre-flight summary::\n")
+print("AMW-DBG::Pre-flight summary::\n")
 print(f"\tCase:         {CASE}")
 print(f"\tProject:      {PROJECT}")
 print(f"\tLicense URL:  {'(set)' if LICENSE_URL else '(machine default)'}")
@@ -485,7 +485,7 @@ if LICENSE_URL:
     project_kwargs["license_url"] = LICENSE_URL
 
 print(SECTION_SEPARATOR)
-print(f"ASR-DBG::Opening AIMMS project::\n\taimms_path={aimms_path}\n\tproject={PROJECT}"
+print(f"AMW-DBG::Opening AIMMS project::\n\taimms_path={aimms_path}\n\tproject={PROJECT}"
       f"\n\tlicense_url={'(set)' if LICENSE_URL else '(machine default)'}\n")
 
 selected_data_file = native_path(CASE)
@@ -518,46 +518,69 @@ def open_and_handshake() -> None:
 
 
 aimms_model = None
-_handshake_error: list[BaseException] = []
 
+HEARTBEAT = 30.0
 
-def _handshake_worker() -> None:
-    try:
-        open_and_handshake()
-    except BaseException as exc:  # re-raised on the main thread below
-        _handshake_error.append(exc)
+# ------------------------------------------------------------------------------
+# run_with_heartbeat()
+# Runs fn() on a worker thread, printing "<label> (Ns)..." every HEARTBEAT
+# seconds, and gives up after timeout seconds (0 = wait indefinitely).
+#
+# Both phases of a PSO run are long and completely silent, which is
+# indistinguishable from a hang at the console: opening compiles the model, and
+# StartupDataID reads the case and solves it -- on the shipped ercot7k case
+# that is close to six minutes during which the script prints two lines. The
+# heartbeat is what stops someone reaching for Task Manager.
+#
+# Returns (finished, error). error is whatever fn() raised, for the caller to
+# report and re-raise on the main thread.
+# ------------------------------------------------------------------------------
+def run_with_heartbeat(fn, label: str, timeout: float) -> tuple[bool, BaseException | None]:
+    box: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            fn()
+        except BaseException as exc:
+            box.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    waited = 0.0
+    while thread.is_alive():
+        remaining = (timeout - waited) if timeout > 0 else None
+
+        if remaining is not None and remaining <= 0:
+            break
+
+        # Never wait past the deadline just because the heartbeat is coarser
+        # than the time left.
+        slice_s = HEARTBEAT if remaining is None else min(HEARTBEAT, remaining)
+        thread.join(slice_s)
+
+        if not thread.is_alive():
+            break
+
+        waited += slice_s
+
+        if remaining is None or waited < timeout:
+            print(f"AMW-DBG: {label} ({waited:.0f}s)...", flush=True)
+
+    return (not thread.is_alive()), (box[0] if box else None)
 
 
 # Generous by default: a cold first open compiles the PSO model, which is slow
 # but finite. Override with DEVNET_PSO_OPEN_TIMEOUT (seconds; 0 disables).
 OPEN_TIMEOUT = float(os.environ.get("DEVNET_PSO_OPEN_TIMEOUT", "600"))
 
-HEARTBEAT = 30.0
+_finished, _handshake_exc = run_with_heartbeat(
+    open_and_handshake, "still opening AIMMS", OPEN_TIMEOUT
+)
+_handshake_error = [_handshake_exc] if _handshake_exc else []
 
-_worker = threading.Thread(target=_handshake_worker, daemon=True)
-_worker.start()
-
-_waited = 0.0
-while _worker.is_alive():
-    remaining = (OPEN_TIMEOUT - _waited) if OPEN_TIMEOUT > 0 else None
-
-    if remaining is not None and remaining <= 0:
-        break
-
-    # Never wait past the deadline just because the heartbeat is coarser
-    # than the time left.
-    _worker.join(HEARTBEAT if remaining is None else min(HEARTBEAT, remaining))
-
-    if not _worker.is_alive():
-        break
-
-    _waited += HEARTBEAT if remaining is None else min(HEARTBEAT, remaining)
-
-    if remaining is None or _waited < OPEN_TIMEOUT:
-        print(f"ASR-DBG: still opening AIMMS ({_waited:.0f}s)...", flush=True)
-
-if _worker.is_alive():
-    print(f"\nASR-ERR: AIMMS did not finish opening within {OPEN_TIMEOUT:.0f}s -- giving up.\n")
+if not _finished:
+    print(f"\nAMW-ERR: AIMMS did not finish opening within {OPEN_TIMEOUT:.0f}s -- giving up.\n")
     print("Two possibilities, and AIMMS's own output above distinguishes them:\n")
     print("  1. It is genuinely still working. A cold first open compiles the PSO")
     print("     model, which is slow but finite. Raise DEVNET_PSO_OPEN_TIMEOUT")
@@ -576,30 +599,51 @@ if _worker.is_alive():
     os._exit(1)          # a live daemon thread blocks a normal interpreter exit
 
 if _handshake_error:
-    print(f"\nASR-ERR: opening the AIMMS project raised: {_handshake_error[0]}\n")
+    print(f"\nAMW-ERR: opening the AIMMS project raised: {_handshake_error[0]}\n")
     print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr
     _log_file_for_prints.close()
     raise _handshake_error[0]
 
-print(f"ASR-DBG::SelectedDataFile::\n\t{selected_data_file}\n")
-print(f"ASR-DBG::ResultsFile::\n\t{results_file}\n")
+print(f"AMW-DBG::SelectedDataFile::\n\t{selected_data_file}\n")
+print(f"AMW-DBG::ResultsFile::\n\t{results_file}\n")
 
 print(SECTION_SEPARATOR)
-print("ASR-DBG::StartupDataID()::\n")
+print("AMW-DBG::StartupDataID()::\n")
+
+# The solve is the longest silent stretch of the run -- on the shipped ercot7k
+# case it is close to six minutes in which nothing at all is printed. Run it
+# under the same heartbeat so it is visibly working. No time limit by default:
+# a legitimate solve is long and case-dependent, and killing one on a guess is
+# worse than waiting. Set DEVNET_PSO_SOLVE_TIMEOUT to bound it.
+SOLVE_TIMEOUT = float(os.environ.get("DEVNET_PSO_SOLVE_TIMEOUT", "0"))
 
 run_failed = False
-try:
-    aimms_model.StartupDataID()
-    print("ASR-DBG: StartupDataID returned OK\n")
-except Exception as e:
-    print(f"ASR-ERR: StartupDataID raised: {e}\n")
+
+_solved, _solve_exc = run_with_heartbeat(
+    aimms_model.StartupDataID, "still solving", SOLVE_TIMEOUT
+)
+
+if not _solved:
+    print(f"\nAMW-ERR: StartupDataID did not finish within {SOLVE_TIMEOUT:.0f}s.\n")
+    print("This is a time limit you set, not evidence that the solve is stuck --")
+    print("raise or clear DEVNET_PSO_SOLVE_TIMEOUT to let it run.\n")
     print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr
     _log_file_for_prints.close()
-    raise
+    os._exit(1)          # a live daemon thread blocks a normal interpreter exit
+
+if _solve_exc is not None:
+    print(f"AMW-ERR: StartupDataID raised: {_solve_exc}\n")
+    print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _log_file_for_prints.close()
+    raise _solve_exc
+
+print("AMW-DBG: StartupDataID returned OK\n")
 
 # ------------------------------------------------------------------------------
 #   Verify a REAL value, never the return code: total served Load out of
@@ -607,21 +651,21 @@ except Exception as e:
 #   StartupDataID() reported.
 # ------------------------------------------------------------------------------
 print(SECTION_SEPARATOR)
-print("ASR-DBG::Verifying solve (results_ED_Ara.csv Load)::\n")
+print("AMW-DBG::Verifying solve (results_ED_Ara.csv Load)::\n")
 
 peak_load = peak_served_load(RESULTS_PATH, REPORT_CYCLE)
 cycle_label = REPORT_CYCLE if REPORT_CYCLE else "all cycles"
 
 if peak_load is None:
-    print("ASR-ERR: results_ED_Ara.csv not found in results dir -- RUN FAILED.\n")
+    print("AMW-ERR: results_ED_Ara.csv not found in results dir -- RUN FAILED.\n")
     run_failed = True
 elif peak_load == 0:
-    print("ASR-ERR: results_ED_Ara.csv Load peaks at 0 MW -- RUN FAILED "
+    print("AMW-ERR: results_ED_Ara.csv Load peaks at 0 MW -- RUN FAILED "
           "(this is the classic forward-slash-path silent failure -- check "
           "SelectedDataFile/ResultsFile above used native separators).\n")
     run_failed = True
 else:
-    print(f"ASR-DBG: Peak served load ({cycle_label}) = {peak_load:,.1f} MW "
+    print(f"AMW-DBG: Peak served load ({cycle_label}) = {peak_load:,.1f} MW "
           f"-- solve looks real.\n")
 
 if run_failed:
@@ -631,7 +675,7 @@ if run_failed:
 #   Results summary
 # ------------------------------------------------------------------------------
 print(SECTION_SEPARATOR)
-print(f"ASR-DBG::Result files written to {RESULTS_PATH}::\n")
+print(f"AMW-DBG::Result files written to {RESULTS_PATH}::\n")
 
 result_files = sorted(Path(RESULTS_PATH).glob("*"))
 for f in result_files:
@@ -643,25 +687,25 @@ print(f"\n\t{len(result_files)} file(s), "
 solves = summarise_solves(RESULTS_PATH)
 if solves:
     breakdown = ", ".join(f"{n} {s}" for s, n in sorted(solves["status"].items()))
-    print(f"ASR-DBG::Solves (results_MC_Solution.csv)::\n"
+    print(f"AMW-DBG::Solves (results_MC_Solution.csv)::\n"
           f"\t{solves['solves']} solve(s): {breakdown}\n")
 else:
-    print("ASR-DBG: results_MC_Solution.csv not found (no solve summary to report).\n")
+    print("AMW-DBG: results_MC_Solution.csv not found (no solve summary to report).\n")
 
 costs = summarise_cycle_cost(RESULTS_PATH)
 if costs:
-    print("ASR-DBG::Cost by cycle (results_MC_Hrzn.csv, DeltaCost)::\n")
+    print("AMW-DBG::Cost by cycle (results_MC_Hrzn.csv, DeltaCost)::\n")
     for cyc in sorted(costs):
         print(f"\t{cyc:8s} {costs[cyc]:20,.3f}")
     print()
 else:
-    print("ASR-DBG: results_MC_Hrzn.csv not found (no cycle costs to report).\n")
+    print("AMW-DBG: results_MC_Hrzn.csv not found (no cycle costs to report).\n")
 
 print(SECTION_SEPARATOR)
 if run_failed:
-    print("ASR-ERR: RUN FAILED -- see aimms.err / debuglog above.\n")
+    print("AMW-ERR: RUN FAILED -- see aimms.err / debuglog above.\n")
 else:
-    print(f"ASR-DBG: RUN OK -- peak served load {peak_load:,.1f} MW ({cycle_label}).\n")
+    print(f"AMW-DBG: RUN OK -- peak served load {peak_load:,.1f} MW ({cycle_label}).\n")
 
 # ------------------------------------------------------------------------------
 # --- Tear down (IMPORTANT: restore orig stdout, stderr handles, then close) ---

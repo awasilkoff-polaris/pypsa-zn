@@ -142,7 +142,7 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
     # mistake -- a misspelled key, or a table where a flat key was meant. Say
     # so, rather than letting the caller report the setting as simply unset.
     if not applied and not any(os.environ.get(env) for env in _MAP.values()):
-        print(f"ASR-ERR: read {path} with {PARSER}, but found no recognized keys.")
+        print(f"AMW-ERR: read {path} with {PARSER}, but found no recognized keys.")
         print(f"Recognized keys: {', '.join(sorted(_MAP))}")
 
     return applied
