@@ -33,8 +33,11 @@
 #     StartupDataID() (SC -> DA -> RT cycle stack, per texas7k_CYC_ID.csv).
 #   - Verifies the solve by reading peak served Load out of
 #     results_ED_Ara.csv -- never trusts the return code alone.
-#   - On failure, prints log/aimms.err and the tail of log/debuglog_*.txt
-#     from the PSO model directory verbatim.
+#   - On failure, prints what this run added to log/aimms.err plus the tail of
+#     log/debuglog_*.txt from the PSO model directory.
+#   - Times out if AIMMS never finishes opening, rather than hanging forever on
+#     an AIMMS that failed to start (a missing solver library is the usual
+#     cause). Override with DEVNET_PSO_OPEN_TIMEOUT.
 #
 # Outputs
 #   - <run-name>/logs/<run-name>_<TS>.log
@@ -50,6 +53,8 @@ import io
 import os
 import subprocess
 import sys
+import threading
+import time
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -146,7 +151,7 @@ def peak_served_load(results_dir: str, cycle: str = "") -> float | None:
     return max(by_interval.values()) if by_interval else 0.0
 
 # ------------------------------------------------------------------------------
-# read_mc_solution()
+# summarise_solves()
 # Summarises the solve: how many solves ran, and their Status breakdown.
 #
 # Deliberately does NOT report results_MC_Solution.csv's Objective column. That
@@ -195,25 +200,52 @@ def summarise_cycle_cost(results_dir: str) -> dict[str, float]:
     return totals
 
 # ------------------------------------------------------------------------------
-# print_pso_error_logs()
-# On a failed / exception-raising run, prints the PSO model directory's
-# log/aimms.err verbatim (the real cause of a PSO failure never appears in the
-# Python exception) plus the tail of the most recent log/debuglog_*.txt.
+# aimms_err_size()
+# Byte size of the PSO model's log/aimms.err, or 0 if absent.
+#
+# AIMMS APPENDS to aimms.err and never truncates it, so the file can hold the
+# history of every case ever run against that project. Recording its size
+# before the run lets the failure path print only what this run added, instead
+# of replaying someone else's errors with the real cause buried at the end.
 # ------------------------------------------------------------------------------
-def print_pso_error_logs(project_path: str) -> None:
+def aimms_err_size(project_path: str) -> int:
+    err_path = os.path.join(os.path.dirname(project_path), "log", "aimms.err")
+    return os.path.getsize(err_path) if os.path.isfile(err_path) else 0
+
+# ------------------------------------------------------------------------------
+# print_pso_error_logs()
+# On a failed / exception-raising run, prints what this run appended to the PSO
+# model directory's log/aimms.err (the real cause of a PSO failure never
+# appears in the Python exception) plus the tail of the latest debuglog.
+# ------------------------------------------------------------------------------
+def print_pso_error_logs(project_path: str, err_offset: int = 0,
+                         since: float = 0.0) -> None:
     model_dir = os.path.dirname(project_path)
     log_dir = os.path.join(model_dir, "log")
 
     err_path = os.path.join(log_dir, "aimms.err")
     print(SUBSECTION_SEPARATOR)
     if os.path.isfile(err_path):
-        print(f"ASR-ERR: contents of {err_path}:\n")
         with open(err_path, "r", encoding="utf-8", errors="replace") as f:
-            print(f.read())
+            f.seek(err_offset)
+            new_text = f.read()
+
+        if new_text.strip():
+            print(f"ASR-ERR: {err_path}, this run only:\n")
+            print(new_text)
+        else:
+            print(f"ASR-ERR: {err_path} gained nothing during this run.")
+            print("AIMMS appends to that file, so anything already in it is from")
+            print("earlier runs and is not this failure.")
     else:
         print(f"ASR-ERR: no aimms.err found at {err_path}")
 
-    debuglogs = sorted(glob.glob(os.path.join(log_dir, "debuglog_*.txt")))
+    # Only a debuglog this run actually wrote. The newest file in that
+    # directory may belong to an entirely different case, and its tail then
+    # reads as though it were this failure.
+    debuglogs = [p for p in sorted(glob.glob(os.path.join(log_dir, "debuglog_*.txt")))
+                 if os.path.getmtime(p) >= since]
+
     if debuglogs:
         latest = debuglogs[-1]
         print(f"\nASR-ERR: tail of {latest}:\n")
@@ -223,7 +255,8 @@ def print_pso_error_logs(project_path: str) -> None:
             print(line, end="")
         print()
     else:
-        print(f"\nASR-ERR: no debuglog_*.txt found in {log_dir}")
+        print(f"\nASR-ERR: this run wrote no debuglog_*.txt in {log_dir}")
+        print("(any older debuglog there belongs to a previous run, so it is not shown)")
     print(SUBSECTION_SEPARATOR)
 
 # ------------------------------------------------------------------------------
@@ -263,6 +296,16 @@ if not os.path.isfile(PROJECT):
 
 # Normalize BEFORE anything is handed to aimmspy -- see native_path().
 PROJECT = native_path(PROJECT)
+
+# AIMMS appends to log/aimms.err and never truncates it, so note how big it is
+# before this run touches anything. The failure path prints only what gets
+# added past this point -- otherwise the real cause arrives buried under every
+# earlier case run against the same PSO project.
+ERR_OFFSET = aimms_err_size(PROJECT)
+
+# Same reasoning for the debuglog: only one written after this instant belongs
+# to this run.
+RUN_START = time.time()
 
 # ------------------------------------------------------------------------------
 #   aimmspy availability, and re-launch into the solve interpreter if needed.
@@ -445,21 +488,100 @@ print(SECTION_SEPARATOR)
 print(f"ASR-DBG::Opening AIMMS project::\n\taimms_path={aimms_path}\n\tproject={PROJECT}"
       f"\n\tlicense_url={'(set)' if LICENSE_URL else '(machine default)'}\n")
 
-project = Project(**project_kwargs)
-aimms_model = project.get_model(__file__)
+selected_data_file = native_path(CASE)
+results_file = native_path(os.path.join(RESULTS_PATH, "results.csv"))
+
 
 # ------------------------------------------------------------------------------
-#   Assign case / results paths and run.
+# open_and_handshake()
+# Opens the AIMMS project and assigns the three model identifiers.
+#
+# Run under a timeout with a heartbeat. Opening a large PSO model is slow and
+# silent, which reads as a hang -- and if AIMMS does fail to start, it prints
+# its reason, exits, and every later aimmspy call blocks on a server that is no
+# longer there. Either way the script used to sit there until it was killed
+# from Task Manager. The heartbeat distinguishes "slow" from "stuck", and the
+# timeout bounds the second case.
 #
 #   native_path() converts to OS-native separators -- see its docstring for
 #   why a forward-slash path here is a silent Load=0 failure, not an error.
 # ------------------------------------------------------------------------------
-selected_data_file = native_path(CASE)
-results_file = native_path(os.path.join(RESULTS_PATH, "results.csv"))
+def open_and_handshake() -> None:
+    global aimms_model
 
-aimms_model.SelectedDataFile.assign(selected_data_file)
-aimms_model.ResultsFile.assign(results_file)
-aimms_model.FileOptionString.assign("CSV text")
+    project = Project(**project_kwargs)
+    aimms_model = project.get_model(__file__)
+
+    aimms_model.SelectedDataFile.assign(selected_data_file)
+    aimms_model.ResultsFile.assign(results_file)
+    aimms_model.FileOptionString.assign("CSV text")
+
+
+aimms_model = None
+_handshake_error: list[BaseException] = []
+
+
+def _handshake_worker() -> None:
+    try:
+        open_and_handshake()
+    except BaseException as exc:  # re-raised on the main thread below
+        _handshake_error.append(exc)
+
+
+# Generous by default: a cold first open compiles the PSO model, which is slow
+# but finite. Override with DEVNET_PSO_OPEN_TIMEOUT (seconds; 0 disables).
+OPEN_TIMEOUT = float(os.environ.get("DEVNET_PSO_OPEN_TIMEOUT", "600"))
+
+HEARTBEAT = 30.0
+
+_worker = threading.Thread(target=_handshake_worker, daemon=True)
+_worker.start()
+
+_waited = 0.0
+while _worker.is_alive():
+    remaining = (OPEN_TIMEOUT - _waited) if OPEN_TIMEOUT > 0 else None
+
+    if remaining is not None and remaining <= 0:
+        break
+
+    # Never wait past the deadline just because the heartbeat is coarser
+    # than the time left.
+    _worker.join(HEARTBEAT if remaining is None else min(HEARTBEAT, remaining))
+
+    if not _worker.is_alive():
+        break
+
+    _waited += HEARTBEAT if remaining is None else min(HEARTBEAT, remaining)
+
+    if remaining is None or _waited < OPEN_TIMEOUT:
+        print(f"ASR-DBG: still opening AIMMS ({_waited:.0f}s)...", flush=True)
+
+if _worker.is_alive():
+    print(f"\nASR-ERR: AIMMS did not finish opening within {OPEN_TIMEOUT:.0f}s -- giving up.\n")
+    print("Two possibilities, and AIMMS's own output above distinguishes them:\n")
+    print("  1. It is genuinely still working. A cold first open compiles the PSO")
+    print("     model, which is slow but finite. Raise DEVNET_PSO_OPEN_TIMEOUT")
+    print(f"     (currently {OPEN_TIMEOUT:.0f}s) and try again.")
+    print("  2. AIMMS failed to start and exited. It prints its reason before")
+    print("     exiting, so scroll up to the lines after the --as-server command.\n")
+    print("Note: 'Unable to load IBM CPLEX library. Exiting.' is NOT a reason to")
+    print("stop here. AIMMS support describe it as harmless under aimmspy; it comes")
+    print("from ODH-CPLEX being present in the solver configuration without a")
+    print("licence for it, and the model still runs. Remove ODH-CPLEX from the")
+    print("solver configuration to silence it, and keep looking for the real cause.\n")
+    print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _log_file_for_prints.close()
+    os._exit(1)          # a live daemon thread blocks a normal interpreter exit
+
+if _handshake_error:
+    print(f"\nASR-ERR: opening the AIMMS project raised: {_handshake_error[0]}\n")
+    print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _log_file_for_prints.close()
+    raise _handshake_error[0]
 
 print(f"ASR-DBG::SelectedDataFile::\n\t{selected_data_file}\n")
 print(f"ASR-DBG::ResultsFile::\n\t{results_file}\n")
@@ -473,7 +595,7 @@ try:
     print("ASR-DBG: StartupDataID returned OK\n")
 except Exception as e:
     print(f"ASR-ERR: StartupDataID raised: {e}\n")
-    print_pso_error_logs(PROJECT)
+    print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr
     _log_file_for_prints.close()
@@ -503,7 +625,7 @@ else:
           f"-- solve looks real.\n")
 
 if run_failed:
-    print_pso_error_logs(PROJECT)
+    print_pso_error_logs(PROJECT, ERR_OFFSET, RUN_START)
 
 # ------------------------------------------------------------------------------
 #   Results summary
