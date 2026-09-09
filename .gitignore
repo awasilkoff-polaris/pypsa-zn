@@ -11,9 +11,11 @@ __pycache__/
 .eggs/
 build/
 dist/
-# aimmspy writes one of these from get_model() on every PSO run. The runner
-# points it at the run directory, which is only ignored by name when the
-# default run name is used -- so ignore the extension too.
+# aimmspy's get_model() insists on writing a 3.8 MB stub of the PSO model
+# somewhere, and there is no way to decline it. The runner sends it to the OS
+# temp directory, so nothing here should produce one any more -- this stays as
+# a backstop, because get_model()'s own default drops a hidden ".pyi" into
+# whatever directory the process was started from.
 *.pyi
 
 # ------------------------------------------------------------------------------

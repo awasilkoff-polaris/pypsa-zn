@@ -53,6 +53,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import logging
@@ -491,12 +492,19 @@ print(f"AMW-DBG::Opening AIMMS project::\n\taimms_path={aimms_path}\n\tproject={
 selected_data_file = native_path(CASE)
 results_file = native_path(os.path.join(RESULTS_PATH, "results.csv"))
 
-# aimmspy's get_model() uses its argument for exactly one thing: it writes an
-# editor stub of the model's identifiers to <dir>/<basename>.pyi. Passing
-# __file__ dropped a 3.8 MB ercot7k_pso.pyi into the repo root on every run --
-# untracked noise, and a stub that claims to type *this script* when what it
-# actually describes is the PSO model. Keep it with the run it came from.
-model_stub = os.path.join(RUN_PATH, "pso_model.pyi")
+# aimmspy's get_model() uses its argument for exactly one thing: it writes a
+# 3.8 MB editor stub of the PSO model's identifiers to <dir>/<basename>.pyi.
+#
+# Nothing here consumes that stub, and it is not a run artifact: it is
+# byte-identical between runs and between cases, because it describes the AIMMS
+# model rather than anything this script did. Passing __file__ dropped it in the
+# repo root on every run -- untracked noise, and a stub that claims to type
+# *this script* when it does nothing of the kind. Keeping a copy per run would
+# just move the noise, so it goes to the OS temp directory and is not kept.
+#
+# There is no way to decline it. get_model()'s own default writes a hidden
+# ".pyi" into the process working directory, which is worse than naming a path.
+model_stub = os.path.join(tempfile.gettempdir(), "pso_model.pyi")
 
 
 # ------------------------------------------------------------------------------
