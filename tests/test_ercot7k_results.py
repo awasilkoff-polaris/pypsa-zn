@@ -83,6 +83,17 @@ REAL_SOLVES = 190
 REAL_DELTACOST = {"RT": 12008467.056, "DA": 20297189.227, "SC": 11727676.824}
 REAL_PEAK_INTERVAL = 184
 REAL_PEAK_LOAD_MW = 46794.465
+
+# The peak-CONGESTION interval, which is what pin_interval() now returns, and
+# the numbers that make it the pin. All measured on the run below.
+#   RT's top binding count of 5 is shared by 101, 102 and 103, so the
+#   lmp_spread tie-break decides, and 103 wins it on 7.4545 against 7.1648 and
+#   4.0070. Interval 236 has the WIDEST spread of the cycle (12.67) on only 4
+#   binding paths, so it is deliberately not the pin -- binding count leads.
+REAL_PIN_INTERVAL = {"RT": 103, "DA": 102, "SC": 103}
+REAL_PIN_N_BINDING = {"RT": 5, "DA": 6, "SC": 6}
+REAL_RT_BINDING_TIE = [101, 102, 103]
+REAL_RT_WIDEST_SPREAD_INTERVAL = 236
 REAL_NODE_COUNT = 6717
 REAL_MAX_PATHS = 1171
 REAL_REPORTED_INTERVALS = (73, 240)
@@ -193,13 +204,69 @@ def test_deltacost_and_allcost_differ_for_da_which_is_why_deltacost_is_used():
     assert rt_all == pytest.approx(REAL_DELTACOST["RT"], abs=0.01)
 
 
-def test_the_pinned_interval_is_the_rt_peak_area_load_interval():
+def test_the_pinned_interval_is_the_rt_peak_congestion_interval():
     assert er.scenario_for_cycle(REAL_RESULTS, "RT") == "ScnRT"
     interval = er.pin_interval(REAL_RESULTS, "RT")
-    assert interval == REAL_PEAK_INTERVAL
+    assert interval == REAL_PIN_INTERVAL["RT"]
+
+    key = er.ReportKey("RT", "ScnRT", interval)
+    paths = er.scan_paths(REAL_RESULTS, key)
+    assert paths.n_binding[interval] == REAL_PIN_N_BINDING["RT"]
+    assert paths.n_binding[interval] == max(paths.n_binding.values())
+
+
+def test_the_pin_is_not_the_peak_load_interval_because_that_hour_is_idle():
+    """
+    The whole reason the rule changed. At the peak LOAD hour the shipped case
+    is uncongested, so a metric pinned there starts at zero and a stress lever
+    has to invent congestion before it reads anything.
+    """
     loads = er.area_load_by_interval(REAL_RESULTS, "RT", "ScnRT")
-    assert loads[interval] == pytest.approx(REAL_PEAK_LOAD_MW, abs=0.001)
-    assert loads[interval] == max(loads.values())
+    peak = min(i for i, v in loads.items() if v == max(loads.values()))
+    assert peak == REAL_PEAK_INTERVAL
+    assert loads[peak] == pytest.approx(REAL_PEAK_LOAD_MW, abs=0.001)
+
+    pinned = er.pin_interval(REAL_RESULTS, "RT")
+    assert pinned != peak
+
+    paths = er.scan_paths(REAL_RESULTS, er.ReportKey("RT", "ScnRT", peak))
+    assert paths.n_binding[peak] == 0
+    assert paths.n_binding[pinned] > 0
+    # ... and the pinned hour carries less load than the peak, by design.
+    assert loads[pinned] < loads[peak]
+
+
+def test_the_binding_count_leads_and_the_spread_only_breaks_ties():
+    """
+    Binding count is the primary key, so the widest-spread interval of the
+    cycle is NOT the pin: 236 spreads 12.67 on 4 paths and loses to 5 paths.
+    The tie-break is still load-bearing -- RT's top count of 5 is a three-way
+    tie -- so both halves of the rule are asserted here.
+    """
+    key = er.ReportKey("RT", "ScnRT", REAL_PIN_INTERVAL["RT"])
+    paths = er.scan_paths(REAL_RESULTS, key)
+    most = max(paths.n_binding.values())
+    tied = sorted(i for i, n in paths.n_binding.items() if n == most)
+    assert tied == REAL_RT_BINDING_TIE
+
+    widest = REAL_RT_WIDEST_SPREAD_INTERVAL
+    assert paths.n_binding[widest] < most
+    assert er.pin_interval(REAL_RESULTS, "RT") != widest
+
+    # The tie is broken on spread, not on the lowest interval.
+    percentiles = er.scan_nodes(REAL_RESULTS, key).percentiles
+    spreads = {i: percentiles[i]["spread_p95_p05"] for i in tied}
+    assert max(spreads, key=lambda i: spreads[i]) == REAL_PIN_INTERVAL["RT"]
+    assert REAL_PIN_INTERVAL["RT"] != min(tied)
+    assert percentiles[widest]["spread_p95_p05"] > max(spreads.values())
+
+
+def test_a_case_where_nothing_binds_refuses_to_pin(monkeypatch):
+    """An uncongested case has no peak-congestion hour; it must say so."""
+    empty = er.PathScan(n_binding={i: 0 for i in range(73, 241)})
+    monkeypatch.setattr(er, "scan_paths", lambda *a, **k: empty)
+    with pytest.raises(er.Ercot7kResultsError, match="no path binds"):
+        er.pin_interval(REAL_RESULTS, "RT")
 
 
 def test_the_reported_cycle_covers_168_contiguous_intervals():
@@ -1039,15 +1106,19 @@ def test_the_cli_pins_into_the_cases_study_json_and_maps_from_it(
 
     assert er.main(["pin", str(REAL_RESULTS), "--case-dir", str(case)]) == 0
     out = capsys.readouterr().out
-    assert "interval : 184" in out
-    assert er.pinned_report_key(case).interval == REAL_PEAK_INTERVAL
+    assert "interval : %d" % REAL_PIN_INTERVAL["RT"] in out
+    assert er.pinned_report_key(case).interval == REAL_PIN_INTERVAL["RT"]
+
+    # The rule that produced the pin travels with it, so a study read years
+    # later says which interval it means and why that one.
+    assert "binding" in er.read_study(case)["pin_rule"]
 
     outdir = tmp_path / "out"
     assert er.main(["map", str(REAL_RESULTS), str(outdir), "t",
                     "--case-dir", str(case)]) == 0
     rows = read_csv_rows(outdir / "t_lmp.csv")
     assert len(rows) - 1 == REAL_NODE_COUNT
-    assert "interval=184" in capsys.readouterr().out
+    assert "interval=%d" % REAL_PIN_INTERVAL["RT"] in capsys.readouterr().out
 
 
 def test_the_cli_refuses_to_guess_the_interval(tmp_path: Path, capsys):

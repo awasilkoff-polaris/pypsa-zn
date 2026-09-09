@@ -36,11 +36,13 @@
 #   - Streams the large result tables with the csv module, filtering on the
 #     pinned reporting triple (cyc, scn, int) as it goes. results_PC_Nd.csv is
 #     287 MB / 3.4M rows in the shipped case; it is never handed to pandas.
-#   - Pins the reported interval ONCE, as the peak-area-load interval of the
+#   - Pins the reported interval ONCE, as the peak-CONGESTION interval of the
 #     reported cycle, and persists it in a small study.json. map_results()
 #     takes the interval as an argument and never guesses: a k_load change
 #     moves the peak hour, and comparing hour 88 against hour 91 moves LMP
-#     spread for reasons that have nothing to do with the lever.
+#     spread for reasons that have nothing to do with the lever. See
+#     pin_interval() for why the rule is congestion and not load -- at the
+#     peak-load hour of the shipped case nothing binds at all.
 #   - Reads the study context (the datacenter injector names) from the case's
 #     pso_case_manifest.json, never by string-matching an injector prefix.
 #   - Derives the asymptote metric: the DC load injector's own LimitViolation
@@ -342,18 +344,63 @@ def area_metrics_by_interval(results_dir: Path, cycle: str,
 # pin_interval()
 #
 # The reported interval must be pinned by the study, not recomputed per run.
-# This is the ONE place that chooses it: the peak ED_Ara.Load interval of the
-# reported cycle, ties broken by the lowest interval so the answer is
-# deterministic. The caller persists the result (write_study()) and passes it
-# to map_results() forever after.
+# This is the ONE place that chooses it, and the rule is peak CONGESTION:
+# the interval of the reported cycle with the most binding paths.
+#
+# It used to be the peak ED_Ara.Load interval, which reads well and measures
+# nothing. MEASURED on the validated run: at the RT peak-load interval (184,
+# 46,794.5 MW) the network is completely uncongested -- all 6,717 nodes price at
+# 53.710, lmp_spread is 0.000 and not one path binds. Pinned there, the headline
+# metric starts at zero and a stress lever has to manufacture congestion out of
+# nothing before it moves at all. Under this rule RT pins 103 instead:
+# 5 binding paths, lmp_spread 7.45, max_loading 1.000. The metric is live.
+#
+# Ties are broken on lmp_spread (P95 - P05) and then on the lowest interval, so
+# the answer is deterministic. The tie-break is not decorative: RT's top binding
+# count of 5 is shared by intervals 101, 102 and 103.
+#
+# Binding is a PSO flag rather than a derived quantity, which is deliberate --
+# it keeps the rule independent of the still-open question of whether
+# lmp_spread is P95-P05 or max-min. Note the two do not agree on the worst
+# hour: interval 236 carries the largest spread (12.67) on only 4 binding
+# paths, so it is NOT the pin.
+#
+# PN_Pth alone answers this in one pass. The 287 MB PC_Nd scan happens only to
+# break an actual tie.
 # ------------------------------------------------------------------------------
 def pin_interval(results_dir: Path, cycle: str = DEFAULT_CYCLE,
                  scenario: Optional[str] = None) -> int:
     if scenario is None:
         scenario = scenario_for_cycle(results_dir, cycle)
-    loads = area_load_by_interval(results_dir, cycle, scenario)
-    peak = max(loads.values())
-    return min(interval for interval, load in loads.items() if load == peak)
+
+    # A ReportKey needs an interval before either scan can be called, and the
+    # scans use it only for a single-interval slice that is discarded here.
+    intervals = sorted(area_load_by_interval(results_dir, cycle, scenario))
+    probe = ReportKey(cycle=cycle, scenario=scenario, interval=intervals[0])
+
+    n_binding = scan_paths(results_dir, probe).n_binding
+    most = max(n_binding.values()) if n_binding else 0
+    if most == 0:
+        raise Ercot7kResultsError(
+            "no path binds in any of the %d intervals of cycle %s, so there is "
+            "no peak-congestion interval to pin. An uncongested case has no "
+            "hour where lmp_spread can move; pin it by hand with "
+            "write_study() if that is genuinely what is being studied."
+            % (len(n_binding), cycle)
+        )
+
+    tied = sorted(interval for interval, n in n_binding.items() if n == most)
+    if len(tied) == 1:
+        return tied[0]
+
+    percentiles = scan_nodes(results_dir, probe).percentiles
+
+    def spread(interval: int) -> float:
+        value = percentiles.get(interval, {}).get("spread_p95_p05", math.nan)
+        return value if _finite(value) else -math.inf
+
+    widest = max(spread(interval) for interval in tied)
+    return min(interval for interval in tied if spread(interval) == widest)
 
 
 # ------------------------------------------------------------------------------
@@ -398,7 +445,9 @@ def write_study(case_dir: Path, key: ReportKey,
         "writer": READER_ID,
         "report": key.as_dict(),
         "pinned_from": str(results_dir) if results_dir is not None else None,
-        "pin_rule": "peak ED_Ara.Load interval of the reported cycle",
+        "pin_rule": ("peak-congestion interval of the reported cycle: most "
+                     "binding PN_Pth paths, ties broken on lmp_spread "
+                     "(P95 - P05) then the lowest interval"),
     }
     text = json.dumps(study, indent=2, sort_keys=False, ensure_ascii=True)
     path.write_bytes((text + "\n").encode("ascii"))
@@ -1548,7 +1597,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    pin = sub.add_parser("pin", help="report the peak-load interval")
+    pin = sub.add_parser("pin", help="report the peak-congestion interval")
     pin.add_argument("results_dir")
     pin.add_argument("--cycle", default=DEFAULT_CYCLE)
     pin.add_argument("--scenario", default=None)
