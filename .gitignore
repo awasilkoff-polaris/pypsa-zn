@@ -66,6 +66,11 @@ devnetDC-sld/
 devnetDC-sld*/
 
 # ercot7k PSO run output (generated -- logs, results; not the case inputs above)
+# Every run nests under this ONE parent, because the run name is the operator's
+# to choose and a root-level run directory could only be ignored by guessing it.
+ercot7k-runs/
+# Pre-nesting layout, still ignored so an existing checkout does not suddenly
+# show 400 MB per old run.
 ercot7k-run/
 ercot7k-run*/
 

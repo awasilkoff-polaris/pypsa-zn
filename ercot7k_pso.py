@@ -344,7 +344,17 @@ if not _has_aimmspy:
 
 # ------------------------------------------------------------------------------
 #   Prompt for run name; create per-run logs/ and results/ dirs.
+#
+#   Every run lands under ONE parent directory, RUNS_DIRNAME, rather than at the
+#   repo root. A run writes 442 MB, and the run name is the operator's to
+#   choose, so a root-level directory can only be ignored by guessing the name:
+#   .gitignore listed "ercot7k-run*/" and the first run called anything else --
+#   "kline90", say -- left 465 MB untracked in a repo whose README calls itself
+#   clean after a run. One nested parent is one ignore rule that cannot be
+#   out-guessed.
 # ------------------------------------------------------------------------------
+RUNS_DIRNAME = "ercot7k-runs"
+
 default_run = "ercot7k-run"
 user_input = input(f"Enter run name [{default_run}]: ").strip()
 RUN_NAME = user_input if user_input else default_run
@@ -356,7 +366,7 @@ if os.sep in RUN_NAME or "/" in RUN_NAME or RUN_NAME == os.path.dirname(DEFAULT_
 
 print(f"AMW-DBG::Using RUN_NAME::\n\t{RUN_NAME}\n")
 
-RUN_PATH = os.path.join(SCRIPT_DIR, RUN_NAME)
+RUN_PATH = os.path.join(SCRIPT_DIR, RUNS_DIRNAME, RUN_NAME)
 LOG_PATH = os.path.join(RUN_PATH, "logs")
 RESULTS_PATH = os.path.join(RUN_PATH, "results")
 
