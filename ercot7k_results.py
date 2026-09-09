@@ -1595,7 +1595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     interval = args.interval
     if interval is None:
         if not args.case_dir:
-            print("ASR-ERR: --interval is required unless --case-dir carries "
+            print("AMW-ERR: --interval is required unless --case-dir carries "
                   "a study.json. The reported interval must be pinned by the "
                   "study, not recomputed per run.", file=sys.stderr)
             return 2

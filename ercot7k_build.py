@@ -177,13 +177,13 @@ def config_rows(csv_path: str) -> list:
 # ------------------------------------------------------------------------------
 def write_csv_if_allowed(path: str, df: pd.DataFrame) -> None:
     if os.path.exists(path):
-        print(f"ASR-DBG: Found existing CSV:\n\t{path}")
+        print(f"AMW-DBG: Found existing CSV:\n\t{path}")
         if not confirm("Overwrite this CSV?"):
-            print("ASR-DBG: Keeping existing CSV.\n")
+            print("AMW-DBG: Keeping existing CSV.\n")
             return
 
     df.to_csv(path, index=False)
-    print(f"ASR-DBG: Wrote CSV:\n\t{path}\n")
+    print(f"AMW-DBG: Wrote CSV:\n\t{path}\n")
 
 
 # ------------------------------------------------------------------------------
@@ -211,10 +211,10 @@ def init_config() -> int:
     print("\t2. Then re-run ercot7k_build.py to write a derived case layer.\n")
 
     if os.path.isdir(CONFIG_PATH):
-        print(f"ASR-DBG: Found existing config folder:\n\t{CONFIG_PATH}\n")
+        print(f"AMW-DBG: Found existing config folder:\n\t{CONFIG_PATH}\n")
     else:
         os.makedirs(CONFIG_PATH)
-        print(f"ASR-DBG: Created config folder:\n\t{CONFIG_PATH}\n")
+        print(f"AMW-DBG: Created config folder:\n\t{CONFIG_PATH}\n")
 
     input("Press Enter to generate / verify default CSV templates...\n")
 
@@ -238,10 +238,10 @@ def init_config() -> int:
         {"lever": "k_load", "target": "", "mode": "scale", "value": 1.10},
     ])
 
-    print("ASR-DBG: Writing datacenter configuration "
+    print("AMW-DBG: Writing datacenter configuration "
           f"({DC_CSV})...")
     write_csv_if_allowed(os.path.join(CONFIG_PATH, DC_CSV), dc_df)
-    print("ASR-DBG: Writing stress lever configuration "
+    print("AMW-DBG: Writing stress lever configuration "
           f"({STRESS_CSV})...")
     write_csv_if_allowed(os.path.join(CONFIG_PATH, STRESS_CSV), stress_df)
 
@@ -335,25 +335,25 @@ def print_case_summary(summary: dict) -> None:
 # ------------------------------------------------------------------------------
 def show_config(config_path: str) -> int:
     print(SECTION_SEPARATOR)
-    print(f"ASR-DBG::ercot7k config path::\n\t{config_path}\n")
+    print(f"AMW-DBG::ercot7k config path::\n\t{config_path}\n")
     if not os.path.isdir(config_path):
-        print(f"ASR-ERR: config folder not found:\n\t{config_path}")
+        print(f"AMW-ERR: config folder not found:\n\t{config_path}")
         return 2
     found = 0
     for name in (DC_CSV, STRESS_CSV):
         path = os.path.join(config_path, name)
         print(SUBSECTION_SEPARATOR)
         if not os.path.isfile(path):
-            print(f"ASR-DBG: {name} is absent")
+            print(f"AMW-DBG: {name} is absent")
             continue
         found += 1
         rows = config_rows(path)
-        print(f"ASR-DBG::{name}:: {len(rows)} active row(s)")
+        print(f"AMW-DBG::{name}:: {len(rows)} active row(s)")
         for row in rows:
             print("\t" + ", ".join(f"{k}={v}" for k, v in row.items()))
     print(SUBSECTION_SEPARATOR)
     if not found:
-        print("ASR-ERR: neither config CSV is present.")
+        print("AMW-ERR: neither config CSV is present.")
         print("Run: python ercot7k_build.py --init")
         return 2
     print(SECTION_SEPARATOR)
@@ -372,7 +372,7 @@ def main() -> int:
         return show_config(rest[0] if rest else CONFIG_PATH)
     unknown = [a for a in args if a not in ("--init", "--help", "-h")]
     if unknown:
-        print(f"ASR-ERR: unrecognized argument(s): {', '.join(unknown)}")
+        print(f"AMW-ERR: unrecognized argument(s): {', '.join(unknown)}")
         print(USAGE)
         return 2
     return build()
@@ -388,20 +388,20 @@ def main() -> int:
 def build() -> int:
     global WRITTEN_LAYER
     print(SECTION_SEPARATOR)
-    print(f"ASR-DBG::ercot7k config path::\n\t{CONFIG_PATH}\n")
+    print(f"AMW-DBG::ercot7k config path::\n\t{CONFIG_PATH}\n")
 
     if not os.path.isdir(CONFIG_PATH):
-        print("ASR-ERR: ercot7k_config folder not found.")
+        print("AMW-ERR: ercot7k_config folder not found.")
         print("Run: python ercot7k_build.py --init")
         return 2
 
     csv_files = sorted(f for f in os.listdir(CONFIG_PATH) if f.endswith(".csv"))
     if not csv_files:
-        print("ASR-ERR: No CSV files found in ercot7k_config.")
+        print("AMW-ERR: No CSV files found in ercot7k_config.")
         print("Run: python ercot7k_build.py --init")
         return 2
 
-    print("ASR-DBG::CSV files found:")
+    print("AMW-DBG::CSV files found:")
     for name in csv_files:
         print(f"\t{name}")
     print("")
@@ -409,7 +409,7 @@ def build() -> int:
     # ----- parent case -----
     parents = candidate_parents()
     if not parents:
-        print(f"ASR-ERR: no case directory found at:\n\t{BASE_CASE_PATH}")
+        print(f"AMW-ERR: no case directory found at:\n\t{BASE_CASE_PATH}")
         return 2
 
     print("Select the parent case to build on:")
@@ -418,10 +418,10 @@ def build() -> int:
         print(f"  {index}) [{kind}] {os.path.relpath(path, SCRIPT_DIR)}")
     choice = input("Enter choice [1]: ").strip() or "1"
     if not choice.isdigit() or not 1 <= int(choice) <= len(parents):
-        print(f"ASR-ERR: invalid choice {choice!r}")
+        print(f"AMW-ERR: invalid choice {choice!r}")
         return 2
     parent_path = parents[int(choice) - 1]
-    print(f"\nASR-DBG::Parent case::\n\t{parent_path}\n")
+    print(f"\nAMW-DBG::Parent case::\n\t{parent_path}\n")
 
     # ----- layer kind -----
     print("Select the layer to build:")
@@ -429,7 +429,7 @@ def build() -> int:
     print(f"  2) Stress layer       (from {STRESS_CSV})")
     kind_choice = input("Enter choice [1]: ").strip() or "1"
     if kind_choice not in ("1", "2"):
-        print(f"ASR-ERR: invalid choice {kind_choice!r}")
+        print(f"AMW-ERR: invalid choice {kind_choice!r}")
         return 2
 
     tables = ec.read_case(parent_path)
@@ -456,9 +456,9 @@ def build() -> int:
     out_name = ec.layer_dir_name(parent_path, slug)
     out_path = os.path.join(DERIVED_ROOT, out_name)
     print(SUBSECTION_SEPARATOR)
-    print(f"ASR-DBG::Layer directory::\n\t{out_path}\n")
+    print(f"AMW-DBG::Layer directory::\n\t{out_path}\n")
     if os.path.exists(out_path):
-        print(f"ASR-ERR: {out_name} already exists. A layer is written once; "
+        print(f"AMW-ERR: {out_name} already exists. A layer is written once; "
               "delete it or change the configuration.")
         return 2
     if not confirm("Write this layer?"):
@@ -475,22 +475,22 @@ def build() -> int:
             manifest = ec.build_stress_layer(parent_path, out_path, rows,
                                              slug=slug)
     except ec.Ercot7kCaseError as exc:
-        print(f"ASR-ERR: {exc}")
+        print(f"AMW-ERR: {exc}")
         return 1
     except NotImplementedError as exc:
-        print(f"ASR-ERR: {exc}")
+        print(f"AMW-ERR: {exc}")
         return 1
 
     # ----- verdict -----
     WRITTEN_LAYER = out_path
-    print(f"ASR-DBG::Layer id::\n\t{manifest['layer_id']}\n")
+    print(f"AMW-DBG::Layer id::\n\t{manifest['layer_id']}\n")
     print("Verification (V1-V13, no PSO run):")
     findings = [ec.Finding(**f) for f in manifest["verification"]["findings"]]
     print(ec.format_findings(findings))
     print("")
     warnings = [f for f in findings if f.level == ec.LEVEL_WARNING]
     for finding in warnings:
-        print(f"ASR-DBG: WARNING {finding.check}: {finding.message}")
+        print(f"AMW-DBG: WARNING {finding.check}: {finding.message}")
     if warnings:
         print("")
 
@@ -514,15 +514,15 @@ def build() -> int:
 def _read_dc_spec():
     path = os.path.join(CONFIG_PATH, DC_CSV)
     if not os.path.isfile(path):
-        print(f"ASR-ERR: {DC_CSV} not found in {CONFIG_PATH}")
+        print(f"AMW-ERR: {DC_CSV} not found in {CONFIG_PATH}")
         print("Run: python ercot7k_build.py --init")
         return None, ""
     rows = config_rows(path)
     if not rows:
-        print(f"ASR-ERR: {DC_CSV} has no active rows")
+        print(f"AMW-ERR: {DC_CSV} has no active rows")
         return None, ""
     if len(rows) > 1:
-        print(f"ASR-ERR: {DC_CSV} has {len(rows)} active rows. One datacenter "
+        print(f"AMW-ERR: {DC_CSV} has {len(rows)} active rows. One datacenter "
               "per layer; multiple datacenters per layer are out of scope. "
               "Move the others below a '# Previous Values' row.")
         return None, ""
@@ -538,7 +538,7 @@ def _read_dc_spec():
             load_shape=(row.get("load_shape") or "flat").strip() or "flat",
         )
     except (KeyError, ValueError) as exc:
-        print(f"ASR-ERR: {DC_CSV} row is not readable: {exc}")
+        print(f"AMW-ERR: {DC_CSV} row is not readable: {exc}")
         return None, ""
     return spec, spec.dc_name.lower()
 
@@ -567,7 +567,7 @@ def _report_datacenter(tables: dict, summary: dict, spec) -> bool:
     print("")
 
     if not node["exists"]:
-        print(f"ASR-ERR: node {spec.node} is not in NDE_ID.Enode. An injector "
+        print(f"AMW-ERR: node {spec.node} is not in NDE_ID.Enode. An injector "
               "mapped to an unknown node falls back to area load distribution, "
               "silently putting the datacenter somewhere else.")
         return False
@@ -582,7 +582,7 @@ def _report_datacenter(tables: dict, summary: dict, spec) -> bool:
           f"({node['monitored_branches']} with Monitor=1)")
     print(f"  injectors already    {len(node['hosted_injectors'])}")
     if node["monitored_branches"] == 0:
-        print("\nASR-DBG: WARNING (V8) this node is touched only by Monitor=0 "
+        print("\nAMW-DBG: WARNING (V8) this node is touched only by Monitor=0 "
               "branches. When Monitor is not flagged, flows are not calculated "
               "and the limit is not enforced, so any congestion the datacenter "
               "creates here is never reported: the case looks clean and is "
@@ -607,7 +607,7 @@ def _report_datacenter(tables: dict, summary: dict, spec) -> bool:
         print("  byog_p_nom <= p_set, so net injection at this node is never "
               "positive: the datacenter can never export.")
     else:
-        print("  ASR-DBG: byog_p_nom > p_set, so this node can EXPORT. That is "
+        print("  AMW-DBG: byog_p_nom > p_set, so this node can EXPORT. That is "
               "a generator sited behind a load, not a behind-the-meter "
               "datacenter; confirm it is intended.")
     print("")
@@ -620,12 +620,12 @@ def _report_datacenter(tables: dict, summary: dict, spec) -> bool:
 def _read_stress_rows():
     path = os.path.join(CONFIG_PATH, STRESS_CSV)
     if not os.path.isfile(path):
-        print(f"ASR-ERR: {STRESS_CSV} not found in {CONFIG_PATH}")
+        print(f"AMW-ERR: {STRESS_CSV} not found in {CONFIG_PATH}")
         print("Run: python ercot7k_build.py --init")
         return None, ""
     rows = config_rows(path)
     if not rows:
-        print(f"ASR-ERR: {STRESS_CSV} has no active rows")
+        print(f"AMW-ERR: {STRESS_CSV} has no active rows")
         return None, ""
     return rows, slug_for_stress(rows)
 
@@ -683,7 +683,7 @@ STAGING_LOG_DIR = os.path.join(DERIVED_ROOT, "logs")
 os.makedirs(STAGING_LOG_DIR, exist_ok=True)
 LOG_NAME = f"ercot7k_build_{TS}.log"
 LOG_PATH = os.path.join(STAGING_LOG_DIR, LOG_NAME)
-print("ASR-DBG::Log file::\n\t{0}\n".format(LOG_PATH))
+print("AMW-DBG::Log file::\n\t{0}\n".format(LOG_PATH))
 
 _log_file_for_prints = open(LOG_PATH, "w", encoding="ascii")  # ONE file handle
 
@@ -712,7 +712,7 @@ try:
 except EOFError:
     # Piped or closed stdin. Say so plainly instead of dumping a traceback: this
     # script is interactive by design and is launched from devnet_menu.py.
-    print("\nASR-ERR: stdin closed while waiting for input. ercot7k_build.py "
+    print("\nAMW-ERR: stdin closed while waiting for input. ercot7k_build.py "
           "is interactive; run it from a terminal or from devnet_menu.py.")
     _rc = 2
 except KeyboardInterrupt:
@@ -733,7 +733,7 @@ if WRITTEN_LAYER and os.path.isdir(WRITTEN_LAYER):
     _target_dir = os.path.join(WRITTEN_LAYER, "logs")
     os.makedirs(_target_dir, exist_ok=True)
     shutil.copyfile(LOG_PATH, os.path.join(_target_dir, LOG_NAME))
-    print(f"ASR-DBG: Log copied into the layer:\n\t"
+    print(f"AMW-DBG: Log copied into the layer:\n\t"
           f"{os.path.join(_target_dir, LOG_NAME)}\n")
 
 sys.exit(_rc)

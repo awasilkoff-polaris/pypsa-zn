@@ -64,6 +64,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -78,6 +79,28 @@ SUBSECTION_SEPARATOR = "-"*40 + "\n"  # for print separation
 WRITER_ID = "ercot7k_case.py/1"
 MANIFEST_NAME = "pso_case_manifest.json"
 MANIFEST_SCHEMA = "ercot7k-case-manifest/1"
+
+# A solved case directory is not the same directory PSO was handed. PSO writes
+# two things back into the *input* folder on every run, and neither is a case
+# input:
+#   <prefix>.status          - PSO1.ams copies the runlog beside SelectedDataFile
+#   <prefix>_SCH_TMP<n>X.csv - TS.ams SchFilterTable leaves the pre-filtered
+#                              schedule copy next to its source. The trailing X
+#                              is the only thing separating it from the real
+#                              SCH_TMP<n> input, so match on that, not on stem.
+#
+# They are excluded here, at the one place that enumerates a case, because
+# read_case() reads whatever this returns: left in, the filtered copy would be
+# picked up as a table named SCH_TMP<n>X and propagated into every derived
+# layer, and the file counts would drift by one after the first solve.
+RUN_ARTIFACT_SUFFIXES = (".status",)
+RUN_ARTIFACT_RE = re.compile(r"_SCH_TMP\d*X\.csv\Z", re.IGNORECASE)
+
+
+def is_run_artifact(name: str) -> bool:
+    """True for a file PSO writes back into the case directory when it solves."""
+    return (name.lower().endswith(RUN_ARTIFACT_SUFFIXES)
+            or RUN_ARTIFACT_RE.search(name) is not None)
 
 DEFAULT_PREFIX = "texas7k"
 
@@ -469,11 +492,16 @@ def case_prefix(case_dir: Path) -> str:
 
 
 def case_files(case_dir: Path) -> List[Path]:
-    """Every regular file of a case directory, manifest excluded, sorted."""
+    """
+    Every regular file of a case directory, sorted, with the manifest and PSO's
+    own run artifacts excluded -- see is_run_artifact() for why a solved case
+    directory holds files that were never inputs.
+    """
     case_dir = Path(case_dir)
     return sorted(
         (p for p in case_dir.iterdir()
-         if p.is_file() and p.name != MANIFEST_NAME),
+         if p.is_file() and p.name != MANIFEST_NAME
+         and not is_run_artifact(p.name)),
         key=lambda p: p.name,
     )
 

@@ -96,6 +96,35 @@ def test_round_trip_of_the_real_case_is_byte_identical():
         assert table.to_bytes() == path.read_bytes(), path.name
 
 
+def test_pso_run_artifacts_are_not_case_inputs(mini_base: Path):
+    """
+    Solving a case leaves files in its *input* directory. They must not be read
+    back as tables: SCH_TMP1X is a filtered copy of SCH_TMP1 restricted to the
+    solved window, so propagating it into a derived layer would ship a
+    truncated schedule under a table name PSO never asked for.
+    """
+    before = ec.case_csv_files(mini_base)
+
+    # Exactly what a real run leaves behind, names taken from PSO's own
+    # construction: <root>.status and <root>_SCH_TMP<n>X.csv.
+    (mini_base / "texas7k.status").write_bytes(b"runlog copy\n")
+    (mini_base / "texas7k_SCH_TMP1X.csv").write_bytes(
+        (mini_base / "texas7k_SCH_TMP1.csv").read_bytes()
+    )
+
+    assert ec.case_csv_files(mini_base) == before
+    assert "SCH_TMP1X" not in ec.read_case(mini_base)
+    assert not any(p.name.endswith(".status")
+                   for p in ec.case_files(mini_base))
+
+    # The guard is the trailing X, so the real input must still be a case file.
+    assert "SCH_TMP1" in ec.read_case(mini_base)
+    assert ec.is_run_artifact("texas7k_SCH_TMP1X.csv")
+    assert ec.is_run_artifact("texas7k_SCH_TMPX.csv")   # the unnumbered form
+    assert not ec.is_run_artifact("texas7k_SCH_TMP1.csv")
+    assert not ec.is_run_artifact("texas7k_SCN_INJ_MAX.csv")  # ends in X.csv
+
+
 def test_round_trip_through_the_filesystem_is_byte_identical(tmp_path: Path):
     for path in ec.case_csv_files(BASE_DIR):
         target = tmp_path / path.name
@@ -956,20 +985,20 @@ def test_the_front_end_executes_at_module_level_so_it_is_never_imported():
 def test_the_front_end_refuses_an_unknown_argument():
     result = run_build("--sweep")
     assert result.returncode == 2
-    assert "ASR-ERR" in result.stdout
+    assert "AMW-ERR" in result.stdout
 
 
 def test_the_front_end_never_dumps_a_traceback_on_a_closed_stdin():
     """Launched from the menu it is interactive; a closed stdin is not a crash.
 
-    Which ASR-ERR comes back depends on whether the operator has generated
+    Which AMW-ERR comes back depends on whether the operator has generated
     ercot7k_config/ yet -- those CSVs are gitignored, so a fresh checkout stops
     at the missing folder and a working copy stops at the first prompt. Either
     way it must be a stated reason and an exit code, not a traceback.
     """
     result = run_build(stdin="")
     assert result.returncode == 2
-    assert "ASR-ERR" in result.stdout
+    assert "AMW-ERR" in result.stdout
     assert "Traceback" not in result.stderr
     assert "Traceback" not in result.stdout
 
@@ -1003,7 +1032,7 @@ def test_previous_values_rows_are_ignored(tmp_path: Path):
 def test_the_front_end_reports_a_missing_config_folder(tmp_path: Path):
     result = run_build("--show-config", str(tmp_path / "absent"))
     assert result.returncode == 2
-    assert "ASR-ERR" in result.stdout
+    assert "AMW-ERR" in result.stdout
 
 
 # ------------------------------------------------------------------------------
