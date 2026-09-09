@@ -389,8 +389,18 @@ def test_verify_case_passes_clean_on_the_fixture():
     assert not ec.has_errors(findings), ec.format_findings(findings)
 
 
-def test_a_real_datacenter_layer_off_ercot7k_verifies_clean(tmp_path: Path):
-    spec = ec.DatacenterSpec(dc_name="DC1", node="N110126", p_set_mw=1000.0,
+@pytest.mark.parametrize("node,why", [
+    # The study node: HEWITT 3, import side of the branch that binds in 69 of
+    # the 168 RT intervals, so load here deepens a live constraint.
+    ("N210144", "congested pocket"),
+    # BAY CITY 3, the old template default: a real 345 kV node on monitored
+    # branches that never binds. Kept as a control -- a layer there must still
+    # verify clean, so a clean verify is not evidence the node does anything.
+    ("N110126", "quiet node"),
+])
+def test_a_real_datacenter_layer_off_ercot7k_verifies_clean(
+        node: str, why: str, tmp_path: Path):
+    spec = ec.DatacenterSpec(dc_name="DC1", node=node, p_set_mw=1000.0,
                              byog_p_nom_mw=500.0, byog_max_mw=500.0,
                              byog_mc=65.0)
     layer = tmp_path / ec.layer_dir_name(BASE_DIR, "dc1")

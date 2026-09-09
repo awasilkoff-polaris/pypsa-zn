@@ -191,12 +191,28 @@ def write_csv_if_allowed(path: str, df: pd.DataFrame) -> None:
 #
 # Generates the two config templates.
 #
-# The active row of each template is a WORKING configuration: N110126 is a real
-# 345 kV node of the base case that sits on a Monitor=1 branch, so a run
-# straight after --init produces a layer that verifies clean. The design
-# document's illustrative node N123456 does not exist in NDE_ID, so it is kept
-# below the "# Previous Values" marker where it documents the example without
-# being read.
+# The active row of each template is a WORKING configuration, and the node is
+# chosen for WHERE IT SITS ELECTRICALLY, not just for passing validation.
+#
+# N210144 is HEWITT 3, 345 kV, on 6 Monitor=1 branches, so a run straight after
+# --init verifies clean. What earns it the default is the measurement: across
+# the 168 RT intervals of the base run only SEVEN branches ever bind, and
+# N210144_N210332_1 -- HEWITT <- RIESEL -- is the most persistent of them at
+# 69/168. Flow on it runs Riesel to Hewitt against a binding limit, so Hewitt is
+# the IMPORT-constrained side: LMP 48.018 there against 23.442 at Riesel across
+# the constraint, the system minimum. Load added at Hewitt deepens a constraint
+# that is already binding, which is what makes the asymptote reachable and BYOG
+# worth anything.
+#
+# The previous default, N110126 (BAY CITY 3), was picked for validation alone.
+# It is a real 345 kV node on monitored branches and it verifies clean, but it
+# never appears in the binding set at all, so a datacenter there is simply
+# served: no congestion response, no asymptote, and a BYOG unit with nothing to
+# displace. It is kept below the marker as the "quiet node" control case.
+#
+# The design document's illustrative node N123456 does not exist in NDE_ID, so
+# it too is kept below the "# Previous Values" marker where it documents the
+# example without being read.
 # ------------------------------------------------------------------------------
 def init_config() -> int:
     print(SECTION_SEPARATOR)
@@ -219,12 +235,16 @@ def init_config() -> int:
     input("Press Enter to generate / verify default CSV templates...\n")
 
     dc_df = pd.DataFrame([
-        {"dc_name": "DC1", "node": "N110126", "p_set_mw": 1000,
+        {"dc_name": "DC1", "node": "N210144", "p_set_mw": 1000,
          "byog_p_nom_mw": 500, "byog_max_mw": 500, "byog_mc": 65,
          "load_shape": "flat"},
         {"dc_name": "# Previous Values", "node": "", "p_set_mw": "",
          "byog_p_nom_mw": "", "byog_max_mw": "", "byog_mc": "",
          "load_shape": ""},
+        # BAY CITY 3: verifies clean but never binds -- the quiet-node control.
+        {"dc_name": "DC1", "node": "N110126", "p_set_mw": 1000,
+         "byog_p_nom_mw": 500, "byog_max_mw": 500, "byog_mc": 65,
+         "load_shape": "flat"},
         {"dc_name": "DC1", "node": "N123456", "p_set_mw": 1000,
          "byog_p_nom_mw": 500, "byog_max_mw": 500, "byog_mc": 65,
          "load_shape": "flat"},

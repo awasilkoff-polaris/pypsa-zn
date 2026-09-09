@@ -94,6 +94,13 @@ REAL_PIN_INTERVAL = {"RT": 103, "DA": 102, "SC": 103}
 REAL_PIN_N_BINDING = {"RT": 5, "DA": 6, "SC": 6}
 REAL_RT_BINDING_TIE = [101, 102, 103]
 REAL_RT_WIDEST_SPREAD_INTERVAL = 236
+
+# Datacenter placement. HEWITT 3 is the import side of N210144_N210332_1, the
+# branch that binds in 69 of the 168 RT intervals -- the most persistent of the
+# only SEVEN branches that ever bind. BAY CITY 3 was the old template default:
+# equally valid, equally clean, and electrically inert.
+DEFAULT_DC_NODE = "N210144"
+QUIET_CONTROL_NODE = "N110126"
 REAL_NODE_COUNT = 6717
 REAL_MAX_PATHS = 1171
 REAL_REPORTED_INTERVALS = (73, 240)
@@ -492,6 +499,45 @@ def test_the_interval_datetime_counts_from_mindate_not_startdate(
     assert clock is not None
     assert clock.text(1) == "2018-04-06 00:00"
     assert clock.text(REAL_REPORTED_INTERVALS[0]) == "2018-04-09 00:00"
+
+
+def test_the_default_datacenter_node_sits_behind_a_binding_constraint():
+    """
+    The template's node is a study decision, not just a validation one, so the
+    reason it was chosen is asserted rather than left in a comment. A node that
+    verifies clean but never binds gives a datacenter that is simply served:
+    no congestion response, no asymptote, nothing for BYOG to displace. That
+    was the old default, and it is the control case here.
+    """
+    brn = ec.read_table(BASE_DIR / "texas7k_BRN_ID.csv").records()
+    nodes = {DEFAULT_DC_NODE, QUIET_CONTROL_NODE}
+    touching = {n: [b for b in brn
+                    if n in (b["FrEnode"], b["ToEnode"])] for n in nodes}
+
+    # Both are 345 kV and monitored, which is why both verify clean and why a
+    # clean verify proves nothing about placement.
+    for node, branches in touching.items():
+        assert branches, node
+        assert all(b["Monitor"] == "1" for b in branches), node
+        assert {b["Voltage"] for b in branches} == {"345.000"}, node
+
+    # What separates them: only the study node terminates a branch that binds.
+    binding = {r["pth"] for r in er.scan_paths(
+        REAL_RESULTS, er.ReportKey("RT", "ScnRT", REAL_PIN_INTERVAL["RT"])
+    ).binding}
+    study = {b["Branch"] for b in touching[DEFAULT_DC_NODE]}
+    quiet = {b["Branch"] for b in touching[QUIET_CONTROL_NODE]}
+    assert study & binding, "the default DC node no longer binds anything"
+    assert not (quiet & binding)
+
+    # And it is the import-constrained side: dearer here than across the limit.
+    lmp = er.scan_nodes(
+        REAL_RESULTS, er.ReportKey("RT", "ScnRT", REAL_PIN_INTERVAL["RT"])).lmp
+    across = [b for b in touching[DEFAULT_DC_NODE]
+              if b["Branch"] in binding][0]
+    far = (across["ToEnode"] if across["FrEnode"] == DEFAULT_DC_NODE
+           else across["FrEnode"])
+    assert lmp[DEFAULT_DC_NODE] > lmp[far]
 
 
 def test_dispatch_sums_to_the_area_load_because_the_base_has_no_load_injector(
