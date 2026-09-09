@@ -11,6 +11,10 @@ __pycache__/
 .eggs/
 build/
 dist/
+# aimmspy writes one of these from get_model() on every PSO run. The runner
+# points it at the run directory, which is only ignored by name when the
+# default run name is used -- so ignore the extension too.
+*.pyi
 
 # ------------------------------------------------------------------------------
 # Virtual environments
@@ -94,6 +98,14 @@ devnet_config/*.csv
 # Ignore run output if a run is written into the case dir
 ercot7k/logs/
 ercot7k/results/
+# PSO writes these two into the *input* folder on every run, so !ercot7k/**
+# above would otherwise offer them up as new case files:
+#   <root>.status            - PSO1.ams copies the runlog beside SelectedDataFile
+#   <root>_SCH_TMP<n>X.csv   - TS.ams SchFilterTable leaves the pre-filtered
+#                              schedule copy next to its source; the trailing X
+#                              is what separates it from the tracked SCH_TMP<n>
+ercot7k/*.status
+ercot7k/*_SCH_TMP*X.csv
 
 # ------------------------------------------------------------------------------
 # Reference outputs (keep controlled artifacts)

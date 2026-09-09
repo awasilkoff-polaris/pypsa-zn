@@ -491,6 +491,13 @@ print(f"AMW-DBG::Opening AIMMS project::\n\taimms_path={aimms_path}\n\tproject={
 selected_data_file = native_path(CASE)
 results_file = native_path(os.path.join(RESULTS_PATH, "results.csv"))
 
+# aimmspy's get_model() uses its argument for exactly one thing: it writes an
+# editor stub of the model's identifiers to <dir>/<basename>.pyi. Passing
+# __file__ dropped a 3.8 MB ercot7k_pso.pyi into the repo root on every run --
+# untracked noise, and a stub that claims to type *this script* when what it
+# actually describes is the PSO model. Keep it with the run it came from.
+model_stub = os.path.join(RUN_PATH, "pso_model.pyi")
+
 
 # ------------------------------------------------------------------------------
 # open_and_handshake()
@@ -510,7 +517,7 @@ def open_and_handshake() -> None:
     global aimms_model
 
     project = Project(**project_kwargs)
-    aimms_model = project.get_model(__file__)
+    aimms_model = project.get_model(model_stub)
 
     aimms_model.SelectedDataFile.assign(selected_data_file)
     aimms_model.ResultsFile.assign(results_file)
