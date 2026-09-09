@@ -357,10 +357,165 @@ def test_a_zero_mw_datacenter_sets_enforce(mini_base: Path, tmp_path: Path):
     assert overrides and all(d.field_map()["Enforce"] == "1" for d in overrides)
 
 
+# ------------------------------------------------------------------------------
+#   k_line -- the per-branch limit derate.
+#
+#   Every negative test here is a row PSO would accept and solve to optimality
+#   while derating nothing.
+# ------------------------------------------------------------------------------
+MONITORED_BRANCH = "TX_N111179_N111180_1"   # 345 kV, Monitor=1, limit 969.800
+UNMONITORED_BRANCH = "N110001_N110041_1"    # 138 kV, Monitor=0, limit 227.900
+
+
+def k_line_row(target: str = MONITORED_BRANCH, value: str = "0.90") -> dict:
+    return {"lever": "k_line", "target": target, "mode": "scale",
+            "value": value}
+
+
+def test_k_line_writes_an_absolute_mw_limit_not_a_scale_factor(
+        mini_base: Path, tmp_path: Path):
+    """
+    The central trap. SCN_BRN_LMT.ScaleFactor scales Schedule and Sequence, not
+    NormalLimit, so a k_line expressed as ScaleFactor on a branch with no
+    schedule derates nothing at all.
+    """
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row()])
+
+    table = ec.read_table(layer / "texas7k_SCN_BRN_LMT.csv")
+    assert table.columns == list(ec.NEW_TABLE_COLUMNS["SCN_BRN_LMT"])
+    rows = table.records()
+    assert len(rows) == 1
+    record = rows[0]
+    assert record["Branch"] == MONITORED_BRANCH
+    # 969.800 * 0.90, as absolute MW.
+    assert record["NormalLimit"] == "872.820"
+    assert record["ScaleFactor"] == "", "ScaleFactor would scale a schedule"
+    assert record["Schedule"] == "" and record["Sequence"] == ""
+
+
+def test_k_line_writes_the_default_scenario_so_every_cycle_inherits(
+        mini_base: Path, tmp_path: Path):
+    """
+    SCN_ARA_LOD.md's general scenario notes, which SCN_BRN_LMT.md defers to:
+    scenario '0' is default data for all scenarios WITHOUT scenario-specific
+    data. The base carries no SCN_BRN_LMT at all, so one '0' row covers SC, DA
+    and RT -- unlike SCN_ARA_LOD, where a '0' row would leave ScnRT at 1.0.
+    """
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row()])
+    rows = ec.read_table(layer / "texas7k_SCN_BRN_LMT.csv").records()
+    assert [r["Scenario"] for r in rows] == ["0"]
+
+
+def test_k_line_refuses_an_unmonitored_branch(mini_base: Path):
+    """
+    BRN_ID.md: when Monitor is not flagged, flows are not calculated and the
+    limit is not enforced. Derating one is provably inert, so this is an error
+    and not a warning.
+    """
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match="Monitor"):
+        ec.stress_deltas([k_line_row(target=UNMONITORED_BRANCH)], tables)
+
+
+def test_k_line_refuses_a_branch_that_does_not_exist(mini_base: Path):
+    tables = ec.read_case(mini_base)
+    # A node name rather than a Branch key is the plausible operator mistake.
+    with pytest.raises(ec.Ercot7kCaseError, match="not in BRN_ID"):
+        ec.stress_deltas([k_line_row(target="N111179")], tables)
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "-0.5"])
+def test_k_line_refuses_a_zero_or_negative_factor(mini_base: Path, value: str):
+    """
+    BRN_ID.md: "If NormalLimit = 0, limits are ignored" -- a zero factor
+    REMOVES the constraint rather than closing the line, and even enforced it
+    means equal phase angles, not an outage. That is SCN_BRN_OPN's job.
+    """
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match="must be positive"):
+        ec.stress_deltas([k_line_row(value=value)], tables)
+
+
+def test_k_line_requires_a_target_and_k_load_refuses_one(mini_base: Path):
+    """The two levers have opposite target contracts; neither may default."""
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match="no target"):
+        ec.stress_deltas([k_line_row(target="")], tables)
+    with pytest.raises(ec.Ercot7kCaseError, match="blank target"):
+        ec.stress_deltas(
+            [{"lever": "k_load", "target": MONITORED_BRANCH,
+              "mode": "scale", "value": "1.10"}], tables)
+
+
+def test_k_line_can_uprate_as_well_as_derate(mini_base: Path,
+                                             tmp_path: Path):
+    """
+    SCN_BRN_LMT.md: scenario limits override static ones, and static limits are
+    "increased as needed to bound scenario limits", so a factor above 1 is
+    meaningful rather than silently clamped.
+    """
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row(value="1.25")])
+    rows = ec.read_table(layer / "texas7k_SCN_BRN_LMT.csv").records()
+    assert rows[0]["NormalLimit"] == "1212.250"   # 969.800 * 1.25
+
+
+def test_v14_catches_a_shadowed_default_scenario_row(mini_base: Path,
+                                                     tmp_path: Path):
+    """
+    A '0' row is inherited only while no scenario states its own value for the
+    same branch. Hand-add a scenario row and the derate silently stops applying
+    to that scenario, so V14 must refuse the case.
+    """
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row()])
+    assert not ec.has_errors(ec.verify_case(layer))
+
+    target = layer / "texas7k_SCN_BRN_LMT.csv"
+    target.write_bytes(
+        target.read_bytes()
+        + ("ScnRT,%s,969.800,,,,\n" % MONITORED_BRANCH).encode("ascii")
+    )
+    findings = ec.verify_case(layer)
+    assert ec.has_errors(findings), ec.format_findings(findings)
+    assert "shadowed" in ec.format_findings(findings)
+
+
+def test_v14_catches_a_derate_of_an_unmonitored_branch(mini_base: Path,
+                                                       tmp_path: Path):
+    """The writer refuses this, so V14 is what catches a hand-edited case."""
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row()])
+    target = layer / "texas7k_SCN_BRN_LMT.csv"
+    target.write_bytes(
+        target.read_bytes()
+        + ("0,%s,200.000,,,,\n" % UNMONITORED_BRANCH).encode("ascii")
+    )
+    findings = ec.verify_case(layer)
+    assert ec.has_errors(findings), ec.format_findings(findings)
+    assert "Monitor=0" in ec.format_findings(findings)
+
+
+def test_v14_catches_a_zero_limit_left_unenforced(mini_base: Path,
+                                                  tmp_path: Path):
+    layer = tmp_path / "kline"
+    ec.build_stress_layer(mini_base, layer, [k_line_row()])
+    target = layer / "texas7k_SCN_BRN_LMT.csv"
+    target.write_bytes(
+        target.read_bytes()
+        + ("0,%s,0.000,,,,\n" % "TX_N111179_N111181_1").encode("ascii")
+    )
+    findings = ec.verify_case(layer)
+    assert ec.has_errors(findings), ec.format_findings(findings)
+    assert "limits are ignored" in ec.format_findings(findings)
+
+
 def test_scenario_override_on_an_unregistered_table_names_the_registry(
         mini_base: Path, tmp_path: Path):
     """Out of scope, absent rather than stubbed: the error names the way in."""
-    for table_name in ("SCN_INJ_CST", "SCN_INJ_OUT", "SCN_BRN_LMT"):
+    for table_name in ("SCN_INJ_CST", "SCN_INJ_OUT"):
         delta = ec.ScenarioOverride.of(table_name, "ScnRT", "X",
                                        {"ScaleFactor": "1.200"})
         with pytest.raises(NotImplementedError, match="SCN_TABLES"):
@@ -870,11 +1025,18 @@ def test_k_load_expands_to_one_all_rows_override():
 
 
 def test_an_unknown_lever_is_refused_and_names_the_implemented_set():
+    # mc_bus is the next lever in the recommended order and is NOT built yet.
+    # If it ever is, this test must move to another unimplemented name rather
+    # than be deleted -- it is the guard on the unknown-lever path itself.
+    unknown = "mc_bus"
+    assert unknown not in ec.STRESS_LEVERS, (
+        "%s is implemented now; point this test at an unbuilt lever" % unknown)
+
     tables = ec.read_case(MINI_DIR)
     with pytest.raises(ec.Ercot7kCaseError) as excinfo:
-        ec.stress_deltas([stress_row(lever="k_line", value="0.90")], tables)
+        ec.stress_deltas([stress_row(lever=unknown, value="0.90")], tables)
     message = str(excinfo.value)
-    assert "k_line" in message
+    assert unknown in message
     for lever in ec.STRESS_LEVERS:
         assert lever in message, "the error must name what IS implemented"
     assert "STRESS_LEVERS" in message

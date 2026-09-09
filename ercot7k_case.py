@@ -138,6 +138,7 @@ TABLE_KEYS: Dict[str, Tuple[str, ...]] = {
     "SCH_ATT": ("Schedule",),
     "SCH_TMP": ("Schedule", "Time"),
     "SCN_ARA_LOD": ("Scenario", "Area"),
+    "SCN_BRN_LMT": ("Scenario", "Branch"),
     "SCN_INJ_DSP": ("Scenario", "Injector"),
     "SCN_INJ_MAX": ("Scenario", "Injector"),
     "STE_NDE": ("State", "Enode"),
@@ -176,6 +177,20 @@ SCN_TABLES: Dict[str, Dict[str, Any]] = {
             "one appended on the default scenario '0'."
         ),
     },
+    "SCN_BRN_LMT": {
+        "key_fields": ("Scenario", "Branch"),
+        "supported": True,
+        "milestone": 2,
+        "op": "create-or-append",
+        "note": (
+            "k_line. The table is absent from the base case, so it is created "
+            "and rows are appended on the default scenario '0' -- which every "
+            "scenario then inherits, because none of them carries "
+            "scenario-specific branch-limit data. NormalLimit is written as "
+            "ABSOLUTE MW; ScaleFactor here scales Schedule and Sequence, not "
+            "the limit."
+        ),
+    },
 }
 
 # Stress levers the expander implements. An unrecognised lever is a hard error
@@ -186,11 +201,23 @@ STRESS_LEVERS: Dict[str, Dict[str, Any]] = {
     "k_load": {
         "modes": ("scale",),
         "table": "SCN_ARA_LOD",
-        "targets": "",
+        "target": "blank",
         "note": (
             "system-wide load scale factor, written to every SCN_ARA_LOD row. "
             "Per-bus and per-area k_load are out of scope, so target must be "
             "blank."
+        ),
+    },
+    "k_line": {
+        "modes": ("scale",),
+        "table": "SCN_BRN_LMT",
+        "target": "branch",
+        "note": (
+            "per-branch normal-limit derate, one named branch per row. The "
+            "target must be a BRN_ID branch with Monitor=1: flows are not even "
+            "computed for an unmonitored branch, so derating one is a no-op "
+            "that reads as a lever. Uniform derating of every monitored "
+            "corridor is a different shape and is not this lever."
         ),
     },
 }
@@ -202,6 +229,11 @@ STRESS_LEVERS: Dict[str, Dict[str, Any]] = {
 NEW_TABLE_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "SCN_INJ_DSP": (
         "Scenario", "Injector", "Dispatch", "Enforce",
+        "ScaleFactor", "Schedule", "Sequence",
+    ),
+    # SCN_BRN_LMT.md field order.
+    "SCN_BRN_LMT": (
+        "Scenario", "Branch", "NormalLimit", "Enforce",
         "ScaleFactor", "Schedule", "Sequence",
     ),
 }
@@ -994,11 +1026,16 @@ def stress_deltas(rows: Sequence[Dict[str, str]],
                 "defaulted, because a 'scale' read as an 'add' is a plausible "
                 "wrong number rather than a visible failure."
                 % (index, lever, mode, lever, ", ".join(entry["modes"])))
-        if target != entry["targets"]:
+        if entry["target"] == "blank" and target != "":
             raise Ercot7kCaseError(
                 "stress row %d sets lever %s with target %r. %s takes a blank "
                 "target: %s"
                 % (index, lever, target, lever, entry["note"]))
+        if entry["target"] != "blank" and target == "":
+            raise Ercot7kCaseError(
+                "stress row %d sets lever %s with no target, and %s needs a "
+                "%s. A blank target is not 'apply everywhere' here: %s"
+                % (index, lever, lever, entry["target"], entry["note"]))
         if value == "":
             raise Ercot7kCaseError(
                 "stress row %d sets lever %s with no value" % (index, lever))
@@ -1010,6 +1047,9 @@ def stress_deltas(rows: Sequence[Dict[str, str]],
 
         if lever == "k_load":
             deltas.append(_k_load_delta(magnitude, tables))
+            continue
+        if lever == "k_line":
+            deltas.append(_k_line_delta(target, magnitude, tables))
             continue
         raise Ercot7kCaseError(
             "lever %s is in STRESS_LEVERS but stress_deltas() has no branch "
@@ -1043,6 +1083,95 @@ def _k_load_delta(factor: float, tables: Dict[str, Table]) -> Delta:
             "system, it is an untouched one." % factor)
     return ScenarioOverride.of(
         "SCN_ARA_LOD", "*", areas[0], {"ScaleFactor": FMT_MW % factor})
+
+
+# ------------------------------------------------------------------------------
+# _k_line_delta()
+#
+# The k_line lever: derate ONE named branch's normal limit.
+#
+# Three things here are documentation-verified rather than guessed, and each of
+# them is a silent wrong answer if taken the obvious way.
+#
+# 1. ScaleFactor does NOT scale the limit. SCN_BRN_LMT.md: "ScaleFactor -
+#    Factor used to scale Schedule and Sequence". A k_line implemented as
+#    ScaleFactor=0.9 on a branch with no Schedule scales nothing at all: the
+#    case runs, the numbers wobble because the solver landed elsewhere, and the
+#    corridor was never derated. So the limit is computed here and written as
+#    absolute MW into NormalLimit.
+#
+# 2. Monitor=1 is required. BRN_ID.md: "When Monitor is flagged, flows are not
+#    calculated and limit is not enforced unless feasibility analysis is used".
+#    In this case Enforce=0 on all 9,140 branches and Monitor=1 on exactly the
+#    1,171 at 345 kV, so derating any other branch is provably inert. That is a
+#    hard error, not a warning.
+#
+# 3. A zero limit is not an outage, in either direction. BRN_ID.md: "If
+#    NormalLimit = 0, limits are ignored" -- so k_line=0 would REMOVE the
+#    constraint rather than close the line. SCN_BRN_LMT.md's Enforce bit exists
+#    for exactly that ambiguity ("Identifies that NormalLimit = 0 should be
+#    enforced"), and even enforced it means equal phase angles across the
+#    branch, not an open one: "Enforcing a zero limit is not the same as
+#    opening a branch." A full outage is SCN_BRN_OPN, which is the k_gen/k_line
+#    outage lever and not this one. So zero is refused.
+#
+# Scenario '0' is deliberate and is what makes one row cover all three cycles.
+# SCN_ARA_LOD.md, the general scenario notes SCN_BRN_LMT.md defers to: "The
+# default scenario (Scenario = '0') identifies default data for all scenarios
+# without scenario-specific data. Default scenario data is IGNORED by scenarios
+# with any scenario-specific data." The base case has no SCN_BRN_LMT rows at
+# all, so nothing shadows the default -- but that also means a case which has
+# acquired scenario-specific rows can no longer be derated this way, which
+# verify_case() checks rather than assuming.
+# ------------------------------------------------------------------------------
+def _k_line_delta(branch: str, factor: float,
+                  tables: Dict[str, Table]) -> Delta:
+    table = tables.get("BRN_ID")
+    if table is None:
+        raise Ercot7kCaseError(
+            "k_line needs a BRN_ID table to read the branch's static limit "
+            "from, and the case has none")
+
+    rows = {r["Branch"]: r for r in table.records()}
+    row = rows.get(branch)
+    if row is None:
+        raise Ercot7kCaseError(
+            "k_line names branch %r, which is not in BRN_ID (%d branches). "
+            "The target is a Branch key, not a substation or a node name."
+            % (branch, len(rows)))
+
+    if row.get("Monitor") != "1":
+        monitored = sum(1 for r in rows.values() if r.get("Monitor") == "1")
+        raise Ercot7kCaseError(
+            "k_line names branch %r, which has Monitor=%r. VERIFIED, "
+            "BRN_ID.md: when Monitor is not flagged, flows are not calculated "
+            "and the limit is not enforced. Derating it changes nothing that "
+            "is computed, so this is refused rather than warned about -- a "
+            "warning here produces a sweep that looks derated and is not. "
+            "%d of the %d branches carry Monitor=1."
+            % (branch, row.get("Monitor", ""), monitored, len(rows)))
+
+    if factor <= 0.0:
+        raise Ercot7kCaseError(
+            "k_line factor %s must be positive. VERIFIED, BRN_ID.md: 'If "
+            "NormalLimit = 0, limits are ignored', so a zero factor REMOVES "
+            "the constraint rather than closing the line. Even enforced via "
+            "SCN_BRN_LMT.Enforce it means equal phase angles across the "
+            "branch, not an open one -- SCN_BRN_LMT.md: 'Enforcing a zero "
+            "limit is not the same as opening a branch.' A full outage is "
+            "SCN_BRN_OPN, which is a different lever." % factor)
+
+    base_limit = _as_float(row.get("NormalLimit", ""))
+    if base_limit != base_limit or base_limit <= 0.0:
+        raise Ercot7kCaseError(
+            "k_line names branch %r, whose BRN_ID.NormalLimit is %r. There is "
+            "no limit to derate: BRN_ID.md reads a NormalLimit of 0 as 'limits "
+            "are ignored', so scaling it leaves the branch unconstrained."
+            % (branch, row.get("NormalLimit", "")))
+
+    return ScenarioOverride.of(
+        "SCN_BRN_LMT", "0", branch,
+        {"NormalLimit": FMT_MW % (base_limit * factor)})
 
 
 # ------------------------------------------------------------------------------
@@ -2029,7 +2158,7 @@ def verify_case(case_dir: Path, strict_monitored: bool = False,
                   _v4_schedule_span, _v5_scenario_rows, _v6_area_load_scale,
                   _v7_injector_domain, _v8_monitored_branch, _v9_parent_diff,
                   _v10_file_set, _v11_capacity_ceiling, _v12_cost_curve_overlap,
-                  _v13_cost_range):
+                  _v13_cost_range, _v14_branch_limit):
         findings.extend(check(ctx))
     return findings
 
@@ -2317,6 +2446,100 @@ def _v5_scenario_rows(ctx: _VerifyContext) -> List[Finding]:
     return [Finding("V5", LEVEL_OK,
                     "%d fixed-dispatch injector(s) carry rows for %s"
                     % (len(have), ", ".join(named)))]
+
+
+# ------------------------------------------------------------------------------
+# V14 -- SCN_BRN_LMT derates a branch that is actually constrained, and the
+#        default-scenario row is not shadowed
+#
+# Three ways a k_line row can be present and mean nothing:
+#
+#   - it names a branch with Monitor=0, whose flow BRN_ID.md says is not even
+#     calculated;
+#   - it carries NormalLimit 0 without Enforce, which BRN_ID.md reads as
+#     "limits are ignored" -- the opposite of a derate;
+#   - it sits on scenario '0' while some scenario carries its own row for the
+#     same branch. SCN_ARA_LOD.md, the general scenario notes SCN_BRN_LMT.md
+#     defers to: "Default scenario data is ignored by scenarios with any
+#     scenario-specific data." The derate would then apply to every cycle
+#     EXCEPT the one that overrode it, which is the reported one often enough
+#     to matter.
+#
+# All three run the case to optimality and report a derate that never happened.
+# ------------------------------------------------------------------------------
+def _v14_branch_limit(ctx: _VerifyContext) -> List[Finding]:
+    rows = ctx.rec("SCN_BRN_LMT")
+    if not rows:
+        return [Finding("V14", LEVEL_SKIP, "no SCN_BRN_LMT table")]
+
+    branches = {r["Branch"]: r for r in ctx.rec("BRN_ID")}
+    out: List[Finding] = []
+
+    missing = sorted({r["Branch"] for r in rows if r["Branch"] not in branches})
+    if missing:
+        out.append(Finding("V14", LEVEL_ERROR,
+                           "SCN_BRN_LMT names %d branch(es) absent from "
+                           "BRN_ID: %s"
+                           % (len(missing), ", ".join(missing[:10]))))
+
+    inert = sorted({r["Branch"] for r in rows
+                    if r["Branch"] in branches
+                    and branches[r["Branch"]].get("Monitor") != "1"})
+    if inert:
+        out.append(Finding("V14", LEVEL_ERROR,
+                           "SCN_BRN_LMT derates %d branch(es) with Monitor=0, "
+                           "whose flows are not calculated at all, so the "
+                           "derate cannot bind: %s"
+                           % (len(inert), ", ".join(inert[:10]))))
+
+    ignored = sorted({
+        r["Branch"] for r in rows
+        if r.get("NormalLimit", "").strip() != ""
+        and _as_float(r["NormalLimit"]) == 0.0
+        and r.get("Enforce", "").strip() != "1"
+    })
+    if ignored:
+        out.append(Finding("V14", LEVEL_ERROR,
+                           "SCN_BRN_LMT sets NormalLimit=0 without Enforce=1 "
+                           "on %d branch(es); BRN_ID.md reads a zero limit as "
+                           "'limits are ignored', which removes the "
+                           "constraint rather than tightening it: %s"
+                           % (len(ignored), ", ".join(ignored[:10]))))
+
+    # The shadowing trap: a '0' row is inherited only while no scenario states
+    # its own value for that same branch.
+    default_rows = {r["Branch"] for r in rows if r["Scenario"] == "0"}
+    shadowed: List[str] = []
+    for record in rows:
+        if record["Scenario"] == "0":
+            continue
+        if record["Branch"] in default_rows:
+            shadowed.append("%s by %s"
+                            % (record["Branch"], record["Scenario"]))
+    if shadowed:
+        out.append(Finding("V14", LEVEL_ERROR,
+                           "%d default-scenario branch limit(s) are shadowed "
+                           "by scenario-specific rows and are therefore "
+                           "ignored for those scenarios: %s"
+                           % (len(shadowed), "; ".join(sorted(shadowed)[:10]))))
+
+    if out:
+        return out
+
+    derated = []
+    for record in rows:
+        base = branches[record["Branch"]].get("NormalLimit", "")
+        if record.get("NormalLimit", "").strip() == "" or base.strip() == "":
+            continue
+        base_mw, new_mw = _as_float(base), _as_float(record["NormalLimit"])
+        if base_mw > 0.0 and new_mw == new_mw:
+            derated.append("%s %.3f->%.3f (%.3f)"
+                           % (record["Branch"], base_mw, new_mw,
+                              new_mw / base_mw))
+    return [Finding("V14", LEVEL_OK,
+                    "%d monitored branch limit(s) overridden on the default "
+                    "scenario, unshadowed: %s"
+                    % (len(rows), "; ".join(derated[:5]) or "no MW change"))]
 
 
 # ------------------------------------------------------------------------------
