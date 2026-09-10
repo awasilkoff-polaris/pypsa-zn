@@ -52,6 +52,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import shutil
 import sys
 import tempfile
@@ -72,9 +73,20 @@ MINI_DIR = REPO_ROOT / "tests" / "fixtures" / "mini7k"
 REFERENCE_RUN = (REPO_ROOT / "devnet-reference-runs"
                  / "devnetDC-sld-27Aug2026" / "stress_out")
 
-# The complete validated run of the exact shipped case. Read-only.
+# The complete validated run of the exact shipped case, read-only, and 442 MB,
+# which is why it is not in the repo. Everything in this module is measured
+# against it rather than against a brief.
+#
+# Set ERCOT7K_REAL_RESULTS to the results/ directory of your own full-cycle run
+# of ercot7k/. Without it these tests SKIP, and a skip is not a pass: the
+# module's whole job is checking the mapper against real numbers, so treat a
+# skipped run as "not tested" rather than "fine". The default is a sibling
+# checkout of the public dataset, which is where it lives on the machine this
+# was developed on.
 REAL_RESULTS = Path(
-    r"D:\repos\ercot-public-dataset\pso\texas7k_fullcycle\results"
+    os.environ.get("ERCOT7K_REAL_RESULTS")
+    or REPO_ROOT.parent / "ercot-public-dataset" / "pso"
+    / "texas7k_fullcycle" / "results"
 )
 
 # Measured on the real run, not taken from a brief. Every one of these is a
@@ -114,7 +126,9 @@ REAL_LOAD_FACTOR_RAW_SUM = 1.13204781007
 
 pytestmark = pytest.mark.skipif(
     not REAL_RESULTS.is_dir(),
-    reason="the validated PSO run at %s is not present" % REAL_RESULTS,
+    reason=("no validated PSO run at %s -- set ERCOT7K_REAL_RESULTS to the "
+            "results/ directory of a full-cycle run of ercot7k/. These tests "
+            "are SKIPPED, not passed." % REAL_RESULTS),
 )
 
 
