@@ -1941,6 +1941,37 @@ def _build_manifest(base_dir: Path, out_dir: Path, chain: Sequence[ChainLayer],
 
 
 # ------------------------------------------------------------------------------
+# inherited_study()
+#
+# A layer's study record describes the CASE, not the delta that made it, so it
+# has to carry forward everything its parent already established.
+#
+# Stacking is the whole point of the chain: a stress layer is built on top of a
+# datacenter layer, and the case it produces still contains that datacenter --
+# the injectors are copied along with every other row. But the manifest used to
+# start from {"datacenters": [], "stress": []} on each build, so the child
+# declared no datacenter. Nothing failed: the case was correct, PSO solved it
+# with the datacenter in place, and map_results() then looked in the manifest,
+# found no datacenter, and reported the entire deliverability block as n/a.
+#
+# That is the asymptote -- the measurement the study exists to make -- silently
+# absent from every stress run, on a case that ran fine. So inheritance happens
+# here, once, in both directions: a datacenter layer keeps its parent's stress
+# rows just as a stress layer keeps its parent's datacenters.
+# ------------------------------------------------------------------------------
+def inherited_study(parent_dir: Path) -> Dict[str, List[Any]]:
+    """The parent's study record, or an empty one if the parent is a base case."""
+    parent_dir = Path(parent_dir)
+    if not has_manifest(parent_dir):
+        return {"datacenters": [], "stress": []}
+    parent = read_manifest(parent_dir).get("study") or {}
+    return {
+        "datacenters": list(parent.get("datacenters") or []),
+        "stress": list(parent.get("stress") or []),
+    }
+
+
+# ------------------------------------------------------------------------------
 # build_datacenter_layer()
 #
 # The Milestone 1 deliverable in one call: a complete, verified datacenter
@@ -1953,8 +1984,8 @@ def build_datacenter_layer(base_dir: Path, out_dir: Path,
     tables = read_case(base_dir)
     deltas = datacenter_deltas(spec, tables)
     timepoints = model_timepoints(tables)
-    study = {
-        "datacenters": [{
+    study = inherited_study(base_dir)
+    study["datacenters"] = study["datacenters"] + [{
             "dc_name": spec.dc_name,
             "node": spec.node,
             "p_set_mw": float(spec.p_set_mw),
@@ -1968,9 +1999,7 @@ def build_datacenter_layer(base_dir: Path, out_dir: Path,
             "expected_dc_mw_by_interval": {
                 time: float(spec.p_set_mw) for time in timepoints
             },
-        }],
-        "stress": [],
-    }
+    }]
     return write_layer(base_dir, out_dir, deltas, study=study,
                        slug=spec.dc_name.lower(),
                        strict_monitored=strict_monitored)
@@ -1995,13 +2024,12 @@ def build_stress_layer(base_dir: Path, out_dir: Path,
         raise Ercot7kCaseError(
             "the stress configuration expanded to no deltas, so this layer "
             "would be a byte-identical copy of its parent under a new name")
-    study = {
-        "datacenters": [],
-        "stress": [{"lever": (r.get("lever") or "").strip(),
-                    "target": (r.get("target") or "").strip(),
-                    "mode": (r.get("mode") or "").strip(),
-                    "value": (r.get("value") or "").strip()} for r in rows],
-    }
+    study = inherited_study(base_dir)
+    study["stress"] = study["stress"] + [
+        {"lever": (r.get("lever") or "").strip(),
+         "target": (r.get("target") or "").strip(),
+         "mode": (r.get("mode") or "").strip(),
+         "value": (r.get("value") or "").strip()} for r in rows]
     return write_layer(base_dir, out_dir, deltas, study=study, slug=slug,
                        strict_monitored=strict_monitored)
 

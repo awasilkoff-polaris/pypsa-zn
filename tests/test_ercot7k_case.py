@@ -512,6 +512,66 @@ def test_v14_catches_a_zero_limit_left_unenforced(mini_base: Path,
     assert "limits are ignored" in ec.format_findings(findings)
 
 
+def test_a_stress_layer_keeps_its_parents_datacenter_in_the_manifest(
+        mini_base: Path, tmp_path: Path):
+    """
+    Stacking is the study shape: a stress layer is built ON a datacenter layer.
+    The injectors are copied like every other row, so the CASE is right and PSO
+    solves it with the datacenter present -- but the manifest used to restart
+    from an empty study, so the child declared no datacenter and map_results()
+    reported the whole deliverability block, the asymptote included, as n/a.
+    A correct case with the measurement silently missing.
+    """
+    dc = tmp_path / "dc"
+    ec.build_datacenter_layer(mini_base, dc, mini_spec())
+    stressed = tmp_path / "dc_kload"
+    ec.build_stress_layer(dc, stressed, [stress_row(value="1.10")])
+
+    parent = ec.read_manifest(dc)["study"]
+    child = ec.read_manifest(stressed)["study"]
+
+    # The datacenter survives into the child, unchanged...
+    assert [d["dc_name"] for d in child["datacenters"]] == ["DC1"]
+    assert child["datacenters"] == parent["datacenters"]
+    # ...alongside the stress the child itself applied.
+    assert [s["lever"] for s in child["stress"]] == ["k_load"]
+
+    # And the case really does still carry the injectors, which is what makes
+    # the manifest's silence a reporting bug rather than a missing datacenter.
+    injectors = {r["Injector"] for r in
+                 ec.read_table(stressed / "texas7k_INJ_ID.csv").records()}
+    assert {"DC1_LOAD", "DC1_BYOG"} <= injectors
+
+
+def test_a_datacenter_layer_keeps_its_parents_stress_in_the_manifest(
+        mini_base: Path, tmp_path: Path):
+    """The same inheritance in the other order, which is equally buildable."""
+    stressed = tmp_path / "kload"
+    ec.build_stress_layer(mini_base, stressed, [stress_row(value="1.10")])
+    dc = tmp_path / "kload_dc"
+    ec.build_datacenter_layer(stressed, dc, mini_spec())
+
+    study = ec.read_manifest(dc)["study"]
+    assert [s["lever"] for s in study["stress"]] == ["k_load"]
+    assert [d["dc_name"] for d in study["datacenters"]] == ["DC1"]
+
+
+def test_three_layers_accumulate_rather_than_overwrite(mini_base: Path,
+                                                       tmp_path: Path):
+    """A chain keeps every contribution, so the manifest reads as the case is."""
+    dc = tmp_path / "dc"
+    ec.build_datacenter_layer(mini_base, dc, mini_spec())
+    one = tmp_path / "one"
+    ec.build_stress_layer(dc, one, [stress_row(value="1.10")])
+    two = tmp_path / "two"
+    ec.build_stress_layer(one, two, [k_line_row()])
+
+    study = ec.read_manifest(two)["study"]
+    assert [d["dc_name"] for d in study["datacenters"]] == ["DC1"]
+    assert [s["lever"] for s in study["stress"]] == ["k_load", "k_line"]
+    assert len(ec.walk_chain(two)) == 4
+
+
 def test_scenario_override_on_an_unregistered_table_names_the_registry(
         mini_base: Path, tmp_path: Path):
     """Out of scope, absent rather than stubbed: the error names the way in."""
