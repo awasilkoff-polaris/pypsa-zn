@@ -140,6 +140,7 @@ TABLE_KEYS: Dict[str, Tuple[str, ...]] = {
     "SCN_ARA_LOD": ("Scenario", "Area"),
     "SCN_BRN_LMT": ("Scenario", "Branch"),
     "SCN_INJ_DSP": ("Scenario", "Injector"),
+    "SCN_INJ_OUT": ("Scenario", "Injector"),
     "SCN_INJ_MAX": ("Scenario", "Injector"),
     "STE_NDE": ("State", "Enode"),
 }
@@ -177,6 +178,18 @@ SCN_TABLES: Dict[str, Dict[str, Any]] = {
             "one appended on the default scenario '0'."
         ),
     },
+    "SCN_INJ_OUT": {
+        "key_fields": ("Scenario", "Injector"),
+        "supported": True,
+        "milestone": 2,
+        "op": "create-or-append",
+        "note": (
+            "k_gen outage. Absent from the base case, so it is created and "
+            "rows appended on the default scenario '0', which every scenario "
+            "inherits. Outage is a BIT: a zero is not 'available', it is "
+            "ignored unless Enforce=1, so this writer only ever writes 1."
+        ),
+    },
     "SCN_BRN_LMT": {
         "key_fields": ("Scenario", "Branch"),
         "supported": True,
@@ -208,6 +221,17 @@ STRESS_LEVERS: Dict[str, Dict[str, Any]] = {
             "blank."
         ),
     },
+    "k_gen": {
+        "modes": ("outage",),
+        "table": "SCN_INJ_OUT",
+        "target": "injector",
+        "note": (
+            "full outage of one named generator, one per row. Takes value 1 "
+            "and nothing else: Outage is a bit, and a 0 does not mean "
+            "'available', it is ignored unless Enforce=1. Partial derate is a "
+            "different mode against SCN_INJ_MAX and is not built yet."
+        ),
+    },
     "k_line": {
         "modes": ("scale",),
         "table": "SCN_BRN_LMT",
@@ -235,6 +259,10 @@ NEW_TABLE_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "SCN_BRN_LMT": (
         "Scenario", "Branch", "NormalLimit", "Enforce",
         "ScaleFactor", "Schedule", "Sequence",
+    ),
+    # SCN_INJ_OUT.md field order.
+    "SCN_INJ_OUT": (
+        "Scenario", "Injector", "Outage", "Enforce", "Schedule", "Sequence",
     ),
 }
 
@@ -1051,6 +1079,9 @@ def stress_deltas(rows: Sequence[Dict[str, str]],
         if lever == "k_line":
             deltas.append(_k_line_delta(target, magnitude, tables))
             continue
+        if lever == "k_gen":
+            deltas.append(_k_gen_outage_delta(target, magnitude, tables))
+            continue
         raise Ercot7kCaseError(
             "lever %s is in STRESS_LEVERS but stress_deltas() has no branch "
             "for it" % lever)
@@ -1172,6 +1203,70 @@ def _k_line_delta(branch: str, factor: float,
     return ScenarioOverride.of(
         "SCN_BRN_LMT", "0", branch,
         {"NormalLimit": FMT_MW % (base_limit * factor)})
+
+
+# ------------------------------------------------------------------------------
+# _k_gen_outage_delta()
+#
+# The k_gen lever in its outage mode: take one named generator out entirely.
+#
+# Outage is a BIT, and the asymmetry matters. SCN_INJ_OUT.md: "Non-zero values
+# identify outages", and Enforce "identifies that Outage = 0 should be
+# enforced". So 1 means out, and 0 does NOT mean "forced available" -- it is
+# ignored like any other blank-or-zero scenario field unless Enforce says
+# otherwise. A lever that accepted 0 would therefore write a row that reads as
+# a deliberate statement and does nothing, so only 1 is accepted.
+#
+# Scenario '0' again, for the reason in _k_line_delta(): the base case has no
+# SCN_INJ_OUT rows, so the default is inherited by SC, DA and RT alike.
+#
+# Not handled here, deliberately: time-varying outages. SCN_INJ_OUT.md warns
+# that a schedule whose start or end falls inside a period is "ignored unless
+# identified for all interval of a period", and that partial-period outages
+# derate dispatch limits instead of removing the unit. A static full outage has
+# none of that ambiguity, which is why lever 2 is the full one and the partial
+# derate is a separate mode against SCN_INJ_MAX.
+# ------------------------------------------------------------------------------
+def _k_gen_outage_delta(injector: str, value: float,
+                        tables: Dict[str, Table]) -> Delta:
+    table = tables.get("INJ_ID")
+    if table is None:
+        raise Ercot7kCaseError(
+            "k_gen needs an INJ_ID table and the case has none")
+
+    rows = {r["Injector"]: r for r in table.records()}
+    row = rows.get(injector)
+    if row is None:
+        raise Ercot7kCaseError(
+            "k_gen names injector %r, which is not in INJ_ID (%d injectors). "
+            "The target is an Injector key, not a node or a substation name."
+            % (injector, len(rows)))
+
+    if value != 1.0:
+        raise Ercot7kCaseError(
+            "k_gen outage takes value 1, not %s. VERIFIED, SCN_INJ_OUT.md: "
+            "Outage is a bit where 'non-zero values identify outages', and a 0 "
+            "is ignored unless Enforce=1 -- it does not mean 'forced "
+            "available'. A fractional value is not a partial outage either; "
+            "that is a derate against SCN_INJ_MAX and a different mode."
+            % value)
+
+    if row.get("LoadFlag") == "1":
+        raise Ercot7kCaseError(
+            "k_gen names %r, which carries LoadFlag=1 and is therefore a LOAD, "
+            "not a generator. Outaging it would delete demand and read in the "
+            "results as a generation contingency. Scale load with k_load."
+            % injector)
+
+    capacity = _as_float(row.get("MaxMw", ""))
+    if capacity != capacity or capacity <= 0.0:
+        raise Ercot7kCaseError(
+            "k_gen names %r, whose INJ_ID.MaxMw is %r. There is no capacity to "
+            "remove, so the outage would be indistinguishable from the base "
+            "case." % (injector, row.get("MaxMw", "")))
+
+    return ScenarioOverride.of(
+        "SCN_INJ_OUT", "0", injector, {"Outage": "1"})
 
 
 # ------------------------------------------------------------------------------
@@ -2186,7 +2281,7 @@ def verify_case(case_dir: Path, strict_monitored: bool = False,
                   _v4_schedule_span, _v5_scenario_rows, _v6_area_load_scale,
                   _v7_injector_domain, _v8_monitored_branch, _v9_parent_diff,
                   _v10_file_set, _v11_capacity_ceiling, _v12_cost_curve_overlap,
-                  _v13_cost_range, _v14_branch_limit):
+                  _v13_cost_range, _v14_branch_limit, _v15_injector_outage):
         findings.extend(check(ctx))
     return findings
 
@@ -2568,6 +2663,78 @@ def _v14_branch_limit(ctx: _VerifyContext) -> List[Finding]:
                     "%d monitored branch limit(s) overridden on the default "
                     "scenario, unshadowed: %s"
                     % (len(rows), "; ".join(derated[:5]) or "no MW change"))]
+
+
+# ------------------------------------------------------------------------------
+# V15 -- SCN_INJ_OUT actually removes a generator, and is not shadowed
+#
+# The same three shapes as V14, in this table's terms. A row can be present and
+# mean nothing when it names an injector that is not there, when it carries
+# Outage=0 without Enforce (ignored, NOT "available"), or when a '0' row is
+# shadowed by a scenario-specific one and so stops applying to that cycle.
+#
+# The fourth is particular to this table: outaging a LoadFlag=1 injector
+# deletes demand while reading, in every report, as a generation contingency.
+# ------------------------------------------------------------------------------
+def _v15_injector_outage(ctx: _VerifyContext) -> List[Finding]:
+    rows = ctx.rec("SCN_INJ_OUT")
+    if not rows:
+        return [Finding("V15", LEVEL_SKIP, "no SCN_INJ_OUT table")]
+
+    injectors = {r["Injector"]: r for r in ctx.rec("INJ_ID")}
+    out: List[Finding] = []
+
+    missing = sorted({r["Injector"] for r in rows
+                      if r["Injector"] not in injectors})
+    if missing:
+        out.append(Finding("V15", LEVEL_ERROR,
+                           "SCN_INJ_OUT names %d injector(s) absent from "
+                           "INJ_ID: %s"
+                           % (len(missing), ", ".join(missing[:10]))))
+
+    ignored = sorted({
+        r["Injector"] for r in rows
+        if _as_float(r.get("Outage", "") or "0") == 0.0
+        and r.get("Enforce", "").strip() != "1"
+    })
+    if ignored:
+        out.append(Finding("V15", LEVEL_ERROR,
+                           "SCN_INJ_OUT carries Outage=0 without Enforce=1 on "
+                           "%d row(s); a zero is ignored rather than meaning "
+                           "'available', so the row states nothing: %s"
+                           % (len(ignored), ", ".join(ignored[:10]))))
+
+    loads = sorted({r["Injector"] for r in rows
+                    if r["Injector"] in injectors
+                    and injectors[r["Injector"]].get("LoadFlag") == "1"})
+    if loads:
+        out.append(Finding("V15", LEVEL_ERROR,
+                           "SCN_INJ_OUT outages %d LoadFlag=1 injector(s), "
+                           "which deletes demand while reporting as a "
+                           "generation contingency: %s"
+                           % (len(loads), ", ".join(loads[:10]))))
+
+    default_rows = {r["Injector"] for r in rows if r["Scenario"] == "0"}
+    shadowed = sorted("%s by %s" % (r["Injector"], r["Scenario"])
+                      for r in rows
+                      if r["Scenario"] != "0" and r["Injector"] in default_rows)
+    if shadowed:
+        out.append(Finding("V15", LEVEL_ERROR,
+                           "%d default-scenario outage(s) are shadowed by "
+                           "scenario-specific rows and so do not apply to "
+                           "those scenarios: %s"
+                           % (len(shadowed), "; ".join(shadowed[:10]))))
+
+    if out:
+        return out
+
+    removed = sum(_as_float(injectors[r["Injector"]].get("MaxMw", "") or "0")
+                  for r in rows
+                  if _as_float(r.get("Outage", "") or "0") != 0.0)
+    return [Finding("V15", LEVEL_OK,
+                    "%d generator outage(s) on the default scenario, "
+                    "unshadowed, removing %.1f MW of capacity"
+                    % (len(rows), removed))]
 
 
 # ------------------------------------------------------------------------------

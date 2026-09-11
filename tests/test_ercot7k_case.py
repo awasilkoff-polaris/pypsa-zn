@@ -512,6 +512,91 @@ def test_v14_catches_a_zero_limit_left_unenforced(mini_base: Path,
     assert "limits are ignored" in ec.format_findings(findings)
 
 
+# ------------------------------------------------------------------------------
+#   k_gen -- the full generator outage.
+# ------------------------------------------------------------------------------
+GEN = "N111180_1"          # 746 MW, LoadFlag=0
+
+
+def k_gen_row(target: str = GEN, value: str = "1") -> dict:
+    return {"lever": "k_gen", "target": target, "mode": "outage",
+            "value": value}
+
+
+def test_k_gen_writes_an_outage_bit_on_the_default_scenario(mini_base: Path,
+                                                            tmp_path: Path):
+    layer = tmp_path / "kgen"
+    ec.build_stress_layer(mini_base, layer, [k_gen_row()])
+
+    table = ec.read_table(layer / "texas7k_SCN_INJ_OUT.csv")
+    assert table.columns == list(ec.NEW_TABLE_COLUMNS["SCN_INJ_OUT"])
+    rows = table.records()
+    assert len(rows) == 1
+    assert rows[0]["Scenario"] == "0"
+    assert rows[0]["Injector"] == GEN
+    assert rows[0]["Outage"] == "1"
+    # The generator itself is untouched: the outage is a scenario override, not
+    # an edit to INJ_ID, so the parent's capacity still reads 746.
+    inj = {r["Injector"]: r for r in
+           ec.read_table(layer / "texas7k_INJ_ID.csv").records()}
+    assert inj[GEN]["MaxMw"] == "746.000"
+
+
+@pytest.mark.parametrize("value", ["0", "0.5", "2"])
+def test_k_gen_takes_only_the_value_one(mini_base: Path, value: str):
+    """
+    Outage is a bit. A 0 is IGNORED rather than meaning 'available', so a row
+    written from it states nothing while looking deliberate; a fraction is not
+    a partial outage either.
+    """
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match="takes value 1"):
+        ec.stress_deltas([k_gen_row(value=value)], tables)
+
+
+def test_k_gen_refuses_to_outage_a_load(mini_base: Path, tmp_path: Path):
+    """
+    Outaging a LoadFlag=1 injector deletes demand while reading, in every
+    report, as a generation contingency -- the most plausible way to produce a
+    confidently wrong reliability result.
+    """
+    dc = tmp_path / "dc"
+    ec.build_datacenter_layer(mini_base, dc, mini_spec())
+    tables = ec.read_case(dc)
+    with pytest.raises(ec.Ercot7kCaseError, match="LoadFlag=1"):
+        ec.stress_deltas([k_gen_row(target="DC1_LOAD")], tables)
+    # BYOG is a generator, so outaging it IS meaningful.
+    assert ec.stress_deltas([k_gen_row(target="DC1_BYOG")], tables)
+
+
+def test_k_gen_refuses_an_unknown_injector(mini_base: Path):
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match="not in INJ_ID"):
+        ec.stress_deltas([k_gen_row(target="N111180")], tables)
+
+
+def test_v15_catches_an_outage_that_states_nothing(mini_base: Path,
+                                                    tmp_path: Path):
+    layer = tmp_path / "kgen"
+    ec.build_stress_layer(mini_base, layer, [k_gen_row()])
+    assert not ec.has_errors(ec.verify_case(layer))
+
+    target = layer / "texas7k_SCN_INJ_OUT.csv"
+    original = target.read_bytes()
+
+    # Outage=0 with no Enforce: ignored, not "available".
+    target.write_bytes(original + b"0,N111181_1,0,,,\n")
+    findings = ec.verify_case(layer)
+    assert ec.has_errors(findings)
+    assert "ignored rather than meaning" in ec.format_findings(findings)
+
+    # A scenario row shadowing the default one.
+    target.write_bytes(original + ("ScnRT,%s,1,,,\n" % GEN).encode("ascii"))
+    findings = ec.verify_case(layer)
+    assert ec.has_errors(findings)
+    assert "shadowed" in ec.format_findings(findings)
+
+
 def test_a_stress_layer_keeps_its_parents_datacenter_in_the_manifest(
         mini_base: Path, tmp_path: Path):
     """
@@ -575,7 +660,7 @@ def test_three_layers_accumulate_rather_than_overwrite(mini_base: Path,
 def test_scenario_override_on_an_unregistered_table_names_the_registry(
         mini_base: Path, tmp_path: Path):
     """Out of scope, absent rather than stubbed: the error names the way in."""
-    for table_name in ("SCN_INJ_CST", "SCN_INJ_OUT"):
+    for table_name in ("SCN_INJ_CST", "SCN_INJ_ADD"):
         delta = ec.ScenarioOverride.of(table_name, "ScnRT", "X",
                                        {"ScaleFactor": "1.200"})
         with pytest.raises(NotImplementedError, match="SCN_TABLES"):
