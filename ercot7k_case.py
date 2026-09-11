@@ -975,17 +975,30 @@ def datacenter_deltas(spec: DatacenterSpec,
                 "SCN_INJ_DSP", scenario, spec.load_injector, fields
             )
         )
-    deltas.append(
-        AddInjector(
-            injector=spec.byog_injector,
-            node=spec.node,
-            load_flag=False,
-            max_mw=float(spec.byog_max_mw),
-            min_mw=0.0,
-            energy_cost=float(spec.byog_mc),
-            name="%s behind-the-meter generation" % spec.dc_name,
+    # A datacenter with no BYOG at all is a first-class configuration, not a
+    # degenerate one: it is the COUNTERFACTUAL the whole BYOG question rests on,
+    # because BYOG's value shows up as price suppression at its own node rather
+    # than as energy, and that is only visible against a run without it.
+    #
+    # It has to be the absence of the injector, not a zero-capacity one. A
+    # zero-MW generator is rejected by V7, and pricing BYOG out instead (a very
+    # high byog_mc) leaves 500 MW of dispatchable capacity in the case, which
+    # still answers a reliability contingency even when it never sets a price.
+    # Those are different experiments.
+    if float(spec.byog_max_mw) > 0.0:
+        deltas.append(
+            AddInjector(
+                injector=spec.byog_injector,
+                node=spec.node,
+                load_flag=False,
+                max_mw=float(spec.byog_max_mw),
+                min_mw=0.0,
+                energy_cost=float(spec.byog_mc),
+                name="%s behind-the-meter generation" % spec.dc_name,
+            )
         )
-    )
+    # No guard needed for "byog_max_mw 0 but byog_p_nom_mw positive": the
+    # p_nom-above-ceiling check above already refuses it, and says more.
     # Only when the per-run capacity is below the study ceiling. When the two
     # are equal INJ_ID.MaxMw alone says everything, and an SCN_INJ_MAX row
     # restating it would be a line of diff carrying no information.
@@ -2085,7 +2098,10 @@ def build_datacenter_layer(base_dir: Path, out_dir: Path,
             "node": spec.node,
             "p_set_mw": float(spec.p_set_mw),
             "load_injector": spec.load_injector,
-            "byog_injector": spec.byog_injector,
+            # Blank when the arm has no BYOG, so the mapper does not go looking
+            # in the results for an injector the case never created.
+            "byog_injector": (spec.byog_injector
+                              if float(spec.byog_max_mw) > 0.0 else ""),
             "byog_p_nom_mw": float(spec.byog_p_nom_mw),
             "byog_max_mw": float(spec.byog_max_mw),
             "byog_mc": float(spec.byog_mc),

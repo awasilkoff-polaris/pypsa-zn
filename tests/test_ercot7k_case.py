@@ -523,6 +523,43 @@ def k_gen_row(target: str = GEN, value: str = "1") -> dict:
             "value": value}
 
 
+def test_a_datacenter_with_no_byog_omits_the_injector_entirely(
+        mini_base: Path, tmp_path: Path):
+    """
+    The no-BYOG arm is the counterfactual, not a degenerate case: BYOG's value
+    is price suppression at its own node, which is only visible against a run
+    without it. It must be the ABSENCE of the unit -- a zero-MW generator is
+    rejected by V7, and pricing BYOG out instead leaves 500 MW of dispatchable
+    capacity that still answers a contingency.
+    """
+    layer = tmp_path / "nobyog"
+    spec = ec.DatacenterSpec(dc_name="DC1", node=MONITORED_NODE,
+                             p_set_mw=100.0, byog_p_nom_mw=0.0,
+                             byog_max_mw=0.0, byog_mc=0.0)
+    manifest = ec.build_datacenter_layer(mini_base, layer, spec)
+
+    injectors = {r["Injector"] for r in
+                 ec.read_table(layer / "texas7k_INJ_ID.csv").records()}
+    assert "DC1_LOAD" in injectors
+    assert "DC1_BYOG" not in injectors
+    assert not ec.has_errors(ec.verify_case(layer))
+
+    # The manifest must not send the mapper looking for an absent injector.
+    entry = manifest["study"]["datacenters"][0]
+    assert entry["byog_injector"] == ""
+    assert entry["byog_max_mw"] == 0.0
+
+
+def test_a_byog_capacity_without_a_ceiling_is_refused(mini_base: Path,
+                                                      tmp_path: Path):
+    """Zeroing only the ceiling is caught by the existing p_nom check."""
+    spec = ec.DatacenterSpec(dc_name="DC1", node=MONITORED_NODE,
+                             p_set_mw=100.0, byog_p_nom_mw=50.0,
+                             byog_max_mw=0.0, byog_mc=65.0)
+    with pytest.raises(ec.Ercot7kCaseError, match="above byog_max_mw"):
+        ec.build_datacenter_layer(mini_base, tmp_path / "bad", spec)
+
+
 def test_k_gen_writes_an_outage_bit_on_the_default_scenario(mini_base: Path,
                                                             tmp_path: Path):
     layer = tmp_path / "kgen"
