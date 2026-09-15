@@ -341,6 +341,42 @@ def area_metrics_by_interval(results_dir: Path, cycle: str,
 
 
 # ------------------------------------------------------------------------------
+# path_limit_by_interval()
+#
+# PN_Pth.Max for ONE named path, per interval.
+#
+# Max is the flow limit PSO enforced, i.e. an INPUT ECHO of BRN_ID.NormalLimit
+# as any SCN_BRN_LMT row amended it. That is what makes it the readback a
+# k_line sweep is checked against: a response variable moving proves the model
+# did something, but only an input echo proves it did what was asked. A sweep
+# whose derate never reached the solver reports the same Max at every step and
+# is otherwise indistinguishable from a network that does not respond.
+#
+# A path that is not reported is ABSENT from the mapping, never 0.0. Only the
+# paths PSO reports appear here, and the reported set is narrower than the
+# monitored set and varies by run -- the reference run reports 1,171 per cycle
+# where our own runs report 7-9. A 0.0 would read as "limit of zero", which
+# BRN_ID.md gives a specific and opposite meaning ("if NormalLimit = 0, limits
+# are ignored"), so it is the one value that must not be invented here.
+# ------------------------------------------------------------------------------
+def path_limit_by_interval(results_dir: Path, cycle: str, scenario: str,
+                           path_name: str) -> Dict[int, float]:
+    path = require_result(results_dir, "PN_Pth")
+    out: Dict[int, float] = {}
+    with result_reader(path) as (columns, rows):
+        i_cyc, i_scn, i_pth, i_int, i_max = column_indexes(
+            columns, ("cyc", "scn", "pth", "int", "Max"), path
+        )
+        for row in rows:
+            if row[i_cyc] != cycle or row[i_scn] != scenario:
+                continue
+            if row[i_pth] != path_name:
+                continue
+            out[int(row[i_int])] = _num(row[i_max])
+    return out
+
+
+# ------------------------------------------------------------------------------
 # pin_interval()
 #
 # The reported interval must be pinned by the study, not recomputed per run.
