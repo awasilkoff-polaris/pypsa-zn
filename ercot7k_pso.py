@@ -29,6 +29,8 @@
 #   - Resolves the PSO case (ercot7k/texas7k.csv by default), the PSO project
 #     (PSO.aimms), and the AIMMS install to use.
 #   - Prompts for a run name and creates per-run logs/ and results/ dirs.
+#     DEVNET_PSO_RUN_NAME and DEVNET_PSO_ASSUME_YES answer the two interactive
+#     gates for a batch driver (ercot7k_sweep.py); unset, both still prompt.
 #   - Opens the AIMMS project via aimmspy and runs the case through
 #     StartupDataID() (SC -> DA -> RT cycle stack, per texas7k_CYC_ID.csv).
 #   - Verifies the solve by reading peak served Load out of
@@ -353,11 +355,27 @@ if not _has_aimmspy:
 #   clean after a run. One nested parent is one ignore rule that cannot be
 #   out-guessed.
 # ------------------------------------------------------------------------------
+#   Both prompts below can be answered by environment instead, because
+#   ercot7k_sweep.py drives this script once per sweep step and cannot answer a
+#   prompt. Unset, nothing changes: the run name is still asked for and the
+#   solve still has to be confirmed. They are deliberately two separate
+#   variables -- a batch driver needs to name its run whether or not it is
+#   skipping the gate, and a human piloting one case should be able to name it
+#   without also disarming the confirmation.
 RUNS_DIRNAME = "ercot7k-runs"
 
+ENV_RUN_NAME = os.environ.get("DEVNET_PSO_RUN_NAME", "").strip()
+ASSUME_YES = os.environ.get("DEVNET_PSO_ASSUME_YES", "").strip().lower() in (
+    "1", "true", "yes", "y",
+)
+
 default_run = "ercot7k-run"
-user_input = input(f"Enter run name [{default_run}]: ").strip()
-RUN_NAME = user_input if user_input else default_run
+if ENV_RUN_NAME:
+    RUN_NAME = ENV_RUN_NAME
+    print(f"AMW-DBG: run name from DEVNET_PSO_RUN_NAME: {RUN_NAME}")
+else:
+    user_input = input(f"Enter run name [{default_run}]: ").strip()
+    RUN_NAME = user_input if user_input else default_run
 
 # Keep run output out of the tracked case directory and out of nested paths.
 if os.sep in RUN_NAME or "/" in RUN_NAME or RUN_NAME == os.path.dirname(DEFAULT_CASE):
@@ -366,7 +384,16 @@ if os.sep in RUN_NAME or "/" in RUN_NAME or RUN_NAME == os.path.dirname(DEFAULT_
 
 print(f"AMW-DBG::Using RUN_NAME::\n\t{RUN_NAME}\n")
 
-RUN_PATH = os.path.join(SCRIPT_DIR, RUNS_DIRNAME, RUN_NAME)
+# DEVNET_PSO_RUNS_ROOT relocates the whole parent, for a batch driver that wants
+# its runs somewhere other than the repo (a scratch volume, say). It must stay in
+# step with ercot7k_sweep.py's --runs-root: the sweep computes each step's
+# results path from what it passed here, so a runner that ignored it would send
+# the results somewhere the mapper does not look -- a solve that succeeds and
+# then reads as a missing file.
+RUNS_ROOT = os.environ.get("DEVNET_PSO_RUNS_ROOT", "").strip() or os.path.join(
+    SCRIPT_DIR, RUNS_DIRNAME)
+
+RUN_PATH = os.path.join(RUNS_ROOT, RUN_NAME)
 LOG_PATH = os.path.join(RUN_PATH, "logs")
 RESULTS_PATH = os.path.join(RUN_PATH, "results")
 
@@ -455,7 +482,10 @@ print(f"\tResults dir:  {RESULTS_PATH}")
 print(f"\tLog file:     {LOG_FILE}")
 print()
 
-if not confirm("Proceed with PSO solve"):
+if ASSUME_YES:
+    print("AMW-DBG: DEVNET_PSO_ASSUME_YES is set -- proceeding without the "
+          "confirm gate.\n")
+elif not confirm("Proceed with PSO solve"):
     print("User aborted before solve. Exiting...")
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr
