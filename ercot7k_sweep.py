@@ -94,6 +94,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -502,6 +503,21 @@ class SweepPlan:
         # directories too, and at two digits run 100 sorts before run 99.
         return "%s-%03d-%s" % (self.sweep_id, index, self.slug(value))
 
+    def identity_digest(self) -> str:
+        """A short hash of everything that makes this sweep this sweep.
+
+        The run marker carries it so that ownership of a results directory
+        means "the same PLAN wrote here", not merely "some sweep with this id
+        did". Without it the marker is a re-encoding of the directory name it
+        was derived from -- run_name is sweep_id + index + slug, which is
+        exactly what the marker recorded -- so it could only ever disagree if
+        someone hand-edited it.
+        """
+        payload = {key: self.as_dict()[key] for key in PLAN_IDENTITY}
+        payload["report"] = self.key.as_dict()
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "schema": SWEEP_SCHEMA,
@@ -632,6 +648,13 @@ def _assert_path_safe(what: str, text: str, allow_empty: bool = False) -> None:
     if text in (os.curdir, os.pardir):
         reasons.append("a path component meaning 'this directory' or 'the "
                        "parent directory'")
+    # Windows silently strips a trailing dot from a directory name, so "foo."
+    # and "foo" are the same directory while reading as two sweep ids -- and
+    # text.strip() does not see it.
+    if text.endswith("."):
+        reasons.append("a trailing '.', which Windows strips, so it would "
+                       "silently share a directory with the same name "
+                       "without it")
     if reasons:
         raise Ercot7kSweepError(
             "the %s %r is not usable as a directory name (it contains %s). It "
@@ -1162,16 +1185,25 @@ def _step_figures(run: Any, key: er.ReportKey) -> Dict[str, Any]:
 #
 # The first version called the composed run name a guard. It is not -- it is
 # the assumption under test, and a reviewer duly deleted a foreign run's
-# results with it: reuse a sweep id whose layers have been archived or whose
-# --derived-root differs, and the write-once layer check that would normally
-# catch the collision never fires, because it guards a different root. That is
-# ~450 MB and six minutes of someone else's solve, gone silently.
+# results with it.
 #
 # So the driver writes a marker beside results/ at step start, and deletion
-# requires that marker to name this sweep and this step. No marker and a
-# non-empty results directory is a COLLISION, not a stale attempt: it is
-# refused rather than cleared, because deletion is the one irreversible thing
-# here and prune_results is held to the same bar.
+# requires it to match. What the marker has to carry is the part that took two
+# goes to get right: sweep_id + step + slug is exactly what run_name is built
+# from, so a marker holding only those is a re-encoding of the directory name
+# it was derived from and can disagree only if hand-edited. It therefore also
+# carries the PLAN DIGEST, which the directory name does not: ownership means
+# "the same plan wrote here", not "something with this id did".
+#
+# What that does and does not defend, stated exactly, because the previous
+# version of this comment claimed more than the code delivered:
+#   - a directory this driver never wrote      -> REFUSED (no marker)
+#   - a different plan reusing this sweep id   -> REFUSED (digest differs),
+#     including when sweep.json has been deleted, which is the one path
+#     assert_plan_unchanged cannot see
+#   - the SAME plan re-running its own step    -> cleared, which is the point:
+#     those files are a failed attempt at exactly this step, and merging into
+#     them would read them as this attempt's
 #
 # Logs are never touched -- a failed attempt's log is the evidence of why it
 # failed.
@@ -1184,7 +1216,9 @@ def _write_run_marker(run_dir: Path, plan: SweepPlan, index: int,
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     payload = {"writer": DRIVER_ID, "sweep_id": plan.sweep_id,
-               "step": int(index), "slug": slug, "written_utc": _utc_now()}
+               "step": int(index), "slug": slug,
+               "plan_digest": plan.identity_digest(),
+               "written_utc": _utc_now()}
     (run_dir / RUN_MARKER_NAME).write_bytes(
         (json.dumps(payload, indent=2) + "\n").encode("ascii",
                                                       "backslashreplace"))
@@ -1201,7 +1235,8 @@ def _marker_matches(run_dir: Path, plan: SweepPlan, index: int,
         return False
     return (payload.get("sweep_id") == plan.sweep_id
             and payload.get("step") == int(index)
-            and payload.get("slug") == slug)
+            and payload.get("slug") == slug
+            and payload.get("plan_digest") == plan.identity_digest())
 
 
 def _clear_previous_attempt(run_dir: Path, plan: SweepPlan, index: int,
@@ -1209,25 +1244,31 @@ def _clear_previous_attempt(run_dir: Path, plan: SweepPlan, index: int,
                             say: Callable[[str], None]) -> List[str]:
     run_dir = Path(run_dir)
     results = run_dir / "results"
-    present = ([p.name for p in sorted(results.iterdir()) if p.is_file()]
+    # rglob, not iterdir: a nested tree under results/ is content too, and
+    # listing only top-level files made a directory holding
+    # results/sub/results_PC_Nd.csv read as empty -- ownership claimed, the
+    # foreign tree merged into this step's output.
+    present = (sorted(p for p in results.rglob("*") if p.is_file())
                if results.is_dir() else [])
     if not present:
         _write_run_marker(run_dir, plan, index, slug)
         return []
     if not _marker_matches(run_dir, plan, index, slug):
         raise Ercot7kSweepError(
-            "%s already holds %d result file(s) and carries no marker saying "
-            "they belong to step %d of sweep %r. They are not this step's to "
-            "delete -- a run directory can survive its layers, so the "
-            "write-once layer check does not cover this. Use a different "
-            "--sweep-id or --runs-root, or move that directory aside."
+            "%s already holds %d result file(s) that are not this step's: "
+            "there is no marker saying step %d of sweep %r, running this "
+            "exact plan, wrote them. A run directory can survive its layers, "
+            "so the write-once layer check does not cover this, and deleting "
+            "them is not this driver's call. Use a different --sweep-id or "
+            "--runs-root, or move that directory aside."
             % (results, len(present), index, plan.sweep_id))
-    for name in present:
-        (results / name).unlink()
+    names = [str(p.relative_to(results)) for p in present]
+    for path in present:
+        path.unlink()
     _write_run_marker(run_dir, plan, index, slug)
     say("  cleared %d file(s) left by an earlier attempt at this step; its "
-        "logs are kept" % len(present))
-    return present
+        "logs are kept" % len(names))
+    return names
 
 
 # ------------------------------------------------------------------------------

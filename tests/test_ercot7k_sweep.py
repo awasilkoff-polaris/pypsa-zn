@@ -196,7 +196,7 @@ def test_a_negative_value_slug_is_directory_safe():
 
 @pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", ".", " lead", "trail ",
                                  "c:name", "a*b", "a?b", "a|b", 'a"b', "a<b",
-                                 "a\tb", "a\nb"])
+                                 "a\tb", "a\nb", "x..", "foo."])
 def test_a_sweep_id_that_is_not_a_plain_name_is_refused(mini_base, bad):
     """It becomes a directory under the sweeps root. A name the validator
     accepts and the filesystem then refuses is worse than one never checked:
@@ -209,10 +209,15 @@ def test_a_sweep_id_that_is_not_a_plain_name_is_refused(mini_base, bad):
                       sweep_id=bad)
 
 
-@pytest.mark.parametrize("ok", ["a..b", "x..", "..y", "k_line-run.2",
-                                "sweep-1"])
+@pytest.mark.parametrize("ok", ["a..b", "..y", "k_line-run.2", "sweep-1"])
 def test_a_plain_name_containing_dots_is_accepted(mini_base, ok):
-    """os.pardir was tested as a SUBSTRING, so legal names were refused."""
+    """os.pardir was tested as a SUBSTRING, so legal names were refused.
+
+    Note "x.." is NOT in this list and is refused by the trailing-dot rule
+    instead: Windows strips a trailing dot, so it would silently share a
+    directory with "x". The two rules looked like they disagreed; the
+    trailing-dot one is right.
+    """
     plan = es.plan_sweep(parent=mini_base, lever="k_load", target="",
                          mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
                          sweep_id=ok)
@@ -606,6 +611,32 @@ def test_an_extra_step_record_is_not_silently_absorbed():
     assert _levels(findings, "W7") == [ec.LEVEL_ERROR]
     assert "3 step records" in next(f.message for f in findings
                                     if f.check == "W7")
+
+
+def test_a_sweep_that_stopped_early_is_a_prefix_not_a_mismatch():
+    """A correct prefix is not a correspondence failure -- W0 already reports
+    the hole accurately, and W7 saying "nothing below this is about the sweep
+    that was asked for" would be the driver claiming more than it knows."""
+    plan = _plan(values=(1.0, 1.1, 1.2))
+    outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W7") == [ec.LEVEL_OK]
+    assert "stopped early" in next(f.message for f in findings
+                                   if f.check == "W7")
+    assert _levels(findings, "W0") == [ec.LEVEL_ERROR], "W0 carries the hole"
+
+
+def test_no_completed_steps_skips_every_witness_check_not_just_w1():
+    """The two SKIP blocks must stay in step: this one is the path nothing
+    pinned, so it was free to drift from its twin."""
+    plan = _plan(values=(1.0, 1.1))
+    failed = es.StepOutcome(index=1, value=1.0, slug=es.step_slug("k_load",
+                                                                  1.0),
+                            returncode=1, error="exit 1")
+    findings = es.check_sweep(plan, [failed])
+    for check in ("W1", "W2", "W3", "W4", "W6"):
+        assert _levels(findings, check) == [ec.LEVEL_SKIP], check
+    assert es.verdict_exit_code(findings) == 1
 
 
 def test_records_matching_the_plan_pass_w7():
@@ -1194,8 +1225,59 @@ def test_a_foreign_run_directorys_results_are_refused_not_deleted(
                             derived_root=tmp_path / "derived",
                             runs_root=runs, run_fn=_honest_solver(runs))
     assert not outcomes[0].ok()
-    assert "carries no marker" in outcomes[0].error
+    assert "not this step's" in outcomes[0].error
     assert (foreign / "results_PC_Nd.csv").is_file(), "nothing was deleted"
+
+
+def test_a_different_plan_reusing_the_sweep_id_does_not_delete_the_results(
+        mini_base, tmp_path):
+    """The marker has to carry something the DIRECTORY NAME does not.
+
+    run_name is sweep_id + index + slug, so a marker holding only those is a
+    re-encoding of the name it came from and can disagree only if hand-edited.
+    The plan digest is the part that makes ownership mean "the same plan wrote
+    here" -- and this is the one path assert_plan_unchanged cannot see, since
+    sweep.json has been removed along with everything else.
+    """
+    runs = tmp_path / "runs"
+    first = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                          mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                          sweep_id="reused")
+    es.run_sweep(first, sweeps_root=tmp_path / "s1",
+                 derived_root=tmp_path / "d1", runs_root=runs,
+                 run_fn=_honest_solver(runs))
+    results = runs / first.run_name(1, 1.0) / "results"
+    assert list(results.iterdir()), "the first sweep wrote results"
+
+    # Same id, DIFFERENT plan, and nothing left to compare it against except
+    # the marker: fresh sweeps root, fresh derived root.
+    second = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                           mode="scale", kmin=1.0, kmax=1.4, kstep=0.2,
+                           sweep_id="reused")
+    outcomes = es.run_sweep(second, sweeps_root=tmp_path / "s2",
+                            derived_root=tmp_path / "d2", runs_root=runs,
+                            run_fn=_honest_solver(runs))
+    assert not outcomes[0].ok()
+    assert "not this step's" in outcomes[0].error
+    assert list(results.iterdir()), "the earlier plan's results survive"
+
+
+def test_a_nested_results_tree_is_not_treated_as_an_empty_directory(
+        mini_base, tmp_path):
+    """Listing only top-level files made a directory holding
+    results/sub/x.csv read as empty: ownership claimed, foreign tree merged
+    into this step's output."""
+    runs = tmp_path / "runs"
+    plan = _sweep_plan_for(mini_base)
+    nested = runs / plan.run_name(1, plan.values[0]) / "results" / "sub"
+    nested.mkdir(parents=True)
+    (nested / "results_PC_Nd.csv").write_text("foreign\n", encoding="ascii")
+
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived",
+                            runs_root=runs, run_fn=_honest_solver(runs))
+    assert not outcomes[0].ok()
+    assert (nested / "results_PC_Nd.csv").is_file(), "nothing was deleted"
 
 
 def test_this_sweeps_own_failed_attempt_is_cleared_on_a_re_run(
@@ -1363,10 +1445,7 @@ def test_the_disk_guard_stops_the_loop_with_the_finished_steps_intact(
     assert outcomes[0].ok()
 
 
-def test_the_disk_guard_sizes_on_the_peak_not_the_pruned_remainder(tmp_path):
-    """--prune shrinks what a step leaves behind, but the next step still
-    writes the full amount first, so sizing on the retained figure would
-    reserve about a tenth of what is needed."""
+def test_enough_disk_for_step_refuses_when_a_step_cannot_fit(tmp_path):
     runs = tmp_path / "runs"
     runs.mkdir()
     fits, why = es.enough_disk_for_step(runs, [10.0, 10.0])
@@ -1376,6 +1455,41 @@ def test_the_disk_guard_sizes_on_the_peak_not_the_pruned_remainder(tmp_path):
     fits, why = es.enough_disk_for_step(runs, [huge])
     assert not fits
     assert "--resume" in why, "it must say the finished steps survive"
+
+
+def test_the_guard_is_handed_the_pre_prune_peak_not_the_remainder(
+        mini_base, tmp_path, monkeypatch):
+    """--prune shrinks what a step LEAVES, but the next step still writes the
+    full amount before anything is pruned, so sizing on the retained figure
+    reserves about a tenth of what is needed.
+
+    Asserted on what the call site actually passes -- the previous version of
+    this test called enough_disk_for_step with literal numbers, so removing
+    peak_results_mb entirely left it passing.
+    """
+    runs = tmp_path / "runs"
+    plan = _sweep_plan_for(mini_base)
+    seen = []
+    real = es.enough_disk_for_step
+
+    def spy(runs_root, measured_mb):
+        seen.append(list(measured_mb))
+        return real(runs_root, measured_mb)
+
+    monkeypatch.setattr(es, "enough_disk_for_step", spy)
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived",
+                            runs_root=runs, run_fn=_honest_solver(runs),
+                            prune=True)
+
+    assert seen, "the guard must be consulted between steps"
+    assert all(o.pruned for o in outcomes), "the fixture must have pruned"
+    peak = outcomes[0].peak_results_mb
+    retained = outcomes[0].results_mb
+    assert peak > retained, "pruning must actually have shrunk the directory"
+    assert seen[0][0] == pytest.approx(peak), (
+        "the guard was sized on the retained %.4f MB, not the peak %.4f MB"
+        % (retained, peak))
 
 
 def test_an_unmeasurable_disk_is_not_treated_as_a_pass(tmp_path):
