@@ -189,6 +189,26 @@ def test_a_negative_value_slug_is_directory_safe():
     assert es.value_slug(-0.5) == "m0p5"
     assert es.step_slug("k_load", 1.2) == "k_load1p2"
     assert es.step_slug("k_load", 1.2, prefix="a-") == "a-k_load1p2"
+    # A small negative at coarse precision must not become a distinct-looking
+    # step that means the same as zero.
+    assert es.value_text(-0.4, 0) == "0"
+
+
+@pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", " lead", "trail ",
+                                 "c:name"])
+def test_a_sweep_id_that_is_not_a_plain_name_is_refused(mini_base, bad):
+    """It becomes a directory under the sweeps root. The runner validates its
+    own run name; these two went unchecked."""
+    with pytest.raises(es.Ercot7kSweepError, match="directory name"):
+        es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                      mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                      sweep_id=bad)
+
+
+def test_run_directories_also_sort_numerically_past_ninety_nine():
+    plan = _plan()
+    names = [plan.run_name(i, 1.0) for i in (9, 10, 99, 100)]
+    assert names == sorted(names)
 
 
 # ------------------------------------------------------------------------------
@@ -434,11 +454,20 @@ def _plan(lever="k_load", target="", values=(1.0, 1.1, 1.2)) -> es.SweepPlan:
 
 
 def _outcome(index, value, witness, written=math.nan, status="Optimal",
-             enforced=math.nan):
+             enforced=math.nan, lever="k_load"):
+    # The slug must be the one the plan would produce, or W7 correctly reports
+    # the record as belonging to a different sweep -- which is exactly what it
+    # is for. Pass lever="k_line" alongside a k_line plan.
     return es.StepOutcome(index=index, value=value,
-                          slug=es.step_slug("k", value), returncode=0,
+                          slug=es.step_slug(lever, value), returncode=0,
                           witness=witness, witness_written=written,
                           witness_enforced=enforced, status=status)
+
+
+def _kline_outcomes(rows):
+    """[(index, value, witness, written, enforced), ...] -> outcomes."""
+    return [_outcome(i, v, w, written=wr, enforced=en, lever="k_line")
+            for i, v, w, wr, en in rows]
 
 
 def _levels(findings, check):
@@ -481,22 +510,37 @@ def test_a_witness_that_moves_by_the_wrong_amount_fails_the_ratio_check():
 
 def test_an_absolute_witness_is_checked_against_what_the_layer_wrote():
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0),
-                _outcome(2, 0.9, 100.0, written=90.0)]
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, 1.0),
+                                (2, 0.9, 100.0, 90.0, 1.0)])
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W3") == [ec.LEVEL_ERROR]
     message = next(f.message for f in findings if f.check == "W3")
     assert "case wrote 90.000, results report 100.000" in message
 
 
-def test_a_missing_witness_names_the_reporting_scope_for_k_line():
+def test_some_steps_unmeasured_warns_and_says_they_are_unverified():
+    """W1 used to ERROR here while its own message said the absence "is NOT by
+    itself evidence of a broken sweep" -- a check contradicting its own text,
+    and one that would hard-fail the very shape of sweep worth running (a
+    corridor slack at the top of the range, binding at the bottom)."""
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0),
-                _outcome(2, 0.9, math.nan, written=90.0)]
+    outcomes = _kline_outcomes([(1, 1.0, math.nan, 100.0, math.nan),
+                                (2, 0.9, 90.0, 90.0, 1.0)])
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W1") == [ec.LEVEL_WARNING]
+    message = next(f.message for f in findings if f.check == "W1")
+    assert "UNVERIFIED" in message
+    assert "reporting scope" in message
+    assert not ec.has_errors(findings)
+
+
+def test_no_step_measured_at_all_is_still_an_error():
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    outcomes = _kline_outcomes([(1, 1.0, math.nan, 100.0, math.nan),
+                                (2, 0.9, math.nan, 90.0, math.nan)])
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W1") == [ec.LEVEL_ERROR]
-    assert "reporting scope" in next(f.message for f in findings
-                                     if f.check == "W1")
+    assert ec.has_errors(findings)
 
 
 def test_a_non_monotone_witness_warns_without_failing_the_sweep():
@@ -505,6 +549,37 @@ def test_a_non_monotone_witness_warns_without_failing_the_sweep():
                 _outcome(3, 1.2, 240.0)]
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W4") == [ec.LEVEL_WARNING]
+
+
+def test_a_record_the_plan_never_asked_for_is_caught_on_an_absolute_lever():
+    """W3 compares two fields of the SAME record, so on an absolute lever a
+    record carrying a value nobody requested agrees with itself and passes.
+    W7 is the only check that asks whether the records are the plan's."""
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, 1.0),
+                                (2, 0.5, 50.0, 50.0, 1.0)])
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK], "it agrees with itself"
+    assert _levels(findings, "W7") == [ec.LEVEL_ERROR]
+    assert ec.has_errors(findings)
+
+
+def test_an_extra_step_record_is_not_silently_absorbed():
+    plan = _plan(values=(1.0, 1.1))
+    outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
+                _outcome(3, 1.2, 240.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W7") == [ec.LEVEL_ERROR]
+    assert "3 step records" in next(f.message for f in findings
+                                    if f.check == "W7")
+
+
+def test_records_matching_the_plan_pass_w7():
+    plan = _plan()
+    outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
+                _outcome(3, 1.2, 240.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W7") == [ec.LEVEL_OK]
 
 
 def test_a_partial_sweep_is_an_error_because_the_curve_has_holes():
@@ -531,9 +606,9 @@ def test_a_limit_never_enforced_at_any_step_fails_even_though_w3_passes():
     was ever in the LP. With ReportAllSolvedPaths a k_line sweep can echo its
     own CSV perfectly at every step while the derate changed nothing."""
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9, 0.8))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0, enforced=0.0),
-                _outcome(2, 0.9, 90.0, written=90.0, enforced=0.0),
-                _outcome(3, 0.8, 80.0, written=80.0, enforced=0.0)]
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, 0.0),
+                                (2, 0.9, 90.0, 90.0, 0.0),
+                                (3, 0.8, 80.0, 80.0, 0.0)])
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W3") == [ec.LEVEL_OK], "it echoes perfectly"
     assert _levels(findings, "W2") == [ec.LEVEL_OK], "and it does vary"
@@ -545,9 +620,9 @@ def test_a_limit_enforced_on_some_steps_warns_rather_than_failing():
     """A corridor slack at k=1.0 and binding at k=0.8 is a GOOD sweep --
     failing its first step would punish the experiment worth running."""
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9, 0.8))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0, enforced=0.0),
-                _outcome(2, 0.9, 90.0, written=90.0, enforced=1.0),
-                _outcome(3, 0.8, 80.0, written=80.0, enforced=1.0)]
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, 0.0),
+                                (2, 0.9, 90.0, 90.0, 1.0),
+                                (3, 0.8, 80.0, 80.0, 1.0)])
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W6") == [ec.LEVEL_WARNING]
     assert not ec.has_errors(findings)
@@ -555,8 +630,8 @@ def test_a_limit_enforced_on_some_steps_warns_rather_than_failing():
 
 def test_enforcement_unknown_warns_and_does_not_claim_the_lever_reached_the_lp():
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0),
-                _outcome(2, 0.9, 90.0, written=90.0)]
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, math.nan),
+                                (2, 0.9, 90.0, 90.0, math.nan)])
     findings = es.check_sweep(plan, outcomes)
     assert _levels(findings, "W6") == [ec.LEVEL_WARNING]
     assert "MaxEnforced" in next(f.message for f in findings if f.check == "W6")
@@ -770,6 +845,115 @@ def test_a_resume_re_runs_a_step_whose_record_is_for_a_different_value(
     assert outcomes[1].witness == pytest.approx(220.0)
 
 
+def _kline_plan(mini_base: Path, branch: str, sweep_id: str) -> es.SweepPlan:
+    return es.plan_sweep(parent=mini_base, lever="k_line", target=branch,
+                         mode="scale", kmin=1.0, kmax=0.8, kstep=-0.1,
+                         sweep_id=sweep_id)
+
+
+def _limit_solver(runs_root: Path, branch: str):
+    """A fake PSO that reports the derated limit the layer actually wrote for
+    the named branch, enforced."""
+    def run_fn(case_csv, run_name, root):
+        layer = Path(case_csv).parent
+        results = Path(runs_root) / run_name / "results"
+        write_fake_results(results, load_mw=BASE_LOAD_MW, path_name=branch,
+                           limit_mw=es.written_witness("k_line", branch,
+                                                       layer),
+                           min_enforced=1, max_enforced=0)
+        return 0, results, 0.5
+    return run_fn
+
+
+def test_a_resume_through_run_sweep_will_not_replay_another_branchs_limits(
+        mini_base, tmp_path):
+    """The hole the previous fix only narrowed.
+
+    step_slug omits the target, so two k_line sweeps over the same values on
+    different branches produce identical slugs. The resume-accept branch
+    returns before _run_one_step, so the layer guard never ran there, and
+    deleting sweep.json removed the only other check -- yielding an all-green
+    verdict over a sweep that solved nothing and reported branch A's limits
+    under branch B's name.
+    """
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    derived = tmp_path / "derived"
+    branches = _monitored_branches(mini_base, 2)
+    a, b = branches[0], branches[1]
+
+    first = _kline_plan(mini_base, a, "s")
+    es.run_sweep(first, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_limit_solver(runs, a))
+
+    # Remove the plan file -- one ordinary file, and the refusal message even
+    # names it.
+    (sweeps / "s" / es.SWEEP_NAME).unlink()
+
+    second = _kline_plan(mini_base, b, "s")
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.run_sweep(second, sweeps_root=sweeps, derived_root=derived,
+                     runs_root=runs, run_fn=_limit_solver(runs, b),
+                     resume=True)
+    assert "no %s" % es.SWEEP_NAME in str(excinfo.value)
+
+
+def test_the_resume_accept_branch_checks_the_layer_it_is_accepting(
+        mini_base, tmp_path):
+    """Belt to the plan guard's braces, and the guard that was being skipped.
+
+    With sweep.json present but the target changed, slug and value still match
+    -- only the layer's own manifest can tell the two apart, so the accept
+    branch has to consult it rather than reason around it.
+    """
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    derived = tmp_path / "derived"
+    a, b = _monitored_branches(mini_base, 2)
+
+    first = _kline_plan(mini_base, a, "s")
+    es.run_sweep(first, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_limit_solver(runs, a))
+
+    # The plan guard would refuse this, so bypass it exactly as a hand-edited
+    # or re-created plan file would, and exercise the in-loop check alone.
+    second = _kline_plan(mini_base, b, "s")
+    es.write_plan(sweeps / "s", second)
+
+    calls = []
+
+    def counting(case_csv, run_name, root):
+        calls.append(run_name)
+        return _limit_solver(runs, b)(case_csv, run_name, root)
+
+    outcomes = es.run_sweep(second, sweeps_root=sweeps, derived_root=derived,
+                            runs_root=runs, run_fn=counting, resume=True)
+
+    # What must NOT happen is branch A's limits being reported as branch B's.
+    # The record is rejected, and the layer behind it is branch A's and is
+    # write-once, so the step stops rather than being re-solved -- which is
+    # why nothing is handed to the solver at all.
+    assert calls == [], "nothing may be solved under the wrong label"
+    assert not outcomes[0].ok()
+    assert "slug-prefix" in outcomes[0].error, (
+        "the error must name the way out: %s" % outcomes[0].error)
+    # And the verdict refuses the sweep rather than reporting it green.
+    findings = es.check_sweep(second, outcomes)
+    assert ec.has_errors(findings)
+    assert es.verdict_exit_code(findings) == 1
+
+
+def _monitored_branches(case_dir: Path, count: int) -> list:
+    prefix = ec.case_prefix(case_dir)
+    table = ec.read_table(case_dir / ("%s_BRN_ID.csv" % prefix))
+    found = [r["Branch"] for r in table.records()
+             if (r.get("Monitor") or "").strip() in ("1", "1.0")]
+    assert len(found) >= count, (
+        "the mini7k fixture has %d monitored branches, need %d"
+        % (len(found), count))
+    return found[:count]
+
+
 def test_a_resume_refuses_a_layer_built_for_a_different_target(
         mini_base, tmp_path):
     """The slug omits the target, so two k_line sweeps over the same values on
@@ -911,8 +1095,8 @@ def test_the_summary_leads_with_what_was_asked_and_what_came_back(
 
 def test_the_summary_flags_the_step_whose_witness_disagrees():
     plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
-    outcomes = [_outcome(1, 1.0, 100.0, written=100.0),
-                _outcome(2, 0.9, 100.0, written=90.0)]
+    outcomes = _kline_outcomes([(1, 1.0, 100.0, 100.0, 1.0),
+                                (2, 0.9, 100.0, 90.0, 1.0)])
     rows = es.summary_rows(plan, outcomes)
     assert [row["witness_ok"] for row in rows] == [1, 0]
 
@@ -1039,6 +1223,23 @@ def test_check_re_runs_the_verdict_over_a_finished_sweep(mini_base, tmp_path):
     assert (sweeps / "unit" / es.REPORT_NAME).is_file()
 
 
+def test_the_disk_is_re_checked_between_steps_against_measured_sizes(tmp_path):
+    """The comment promised the estimate was 'replaced by the real figure as
+    soon as one step has finished'. It was not -- projection() ran once and
+    nothing re-checked, so the stated rationale (stop before filling the
+    volume) rested on a static 450 MB guess."""
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    fits, why = es.enough_disk_for_step(runs, [10.0, 10.0])
+    assert fits and why == ""
+
+    # A step measured larger than the whole volume cannot fit.
+    huge = shutil.disk_usage(str(runs)).free / (1024.0 * 1024.0) + 1_000_000
+    fits, why = es.enough_disk_for_step(runs, [huge])
+    assert not fits
+    assert "--resume" in why, "it must say the finished steps survive"
+
+
 def test_an_unmeasurable_disk_is_not_treated_as_a_pass(tmp_path):
     """The module says in several places that a SKIP is not a pass; its own
     disk guard used to return 'fits' when free space could not be read."""
@@ -1073,6 +1274,48 @@ def test_a_truncated_step_record_names_the_problem_rather_than_keyerroring(
         tmp_path):
     with pytest.raises(es.Ercot7kSweepError, match="truncated"):
         es.outcome_from_dict({"index": 1})
+
+
+def test_the_run_subcommand_reports_a_refusal_rather_than_a_traceback(
+        mini_base, tmp_path, monkeypatch, capsys):
+    """The `run` path's exception handling had never executed in the suite --
+    every resume test called run_sweep in-process -- which is how a refusal
+    added for the resume holes came to surface as a stack trace and exit 1,
+    the same code as "the sweep ran and was found broken".
+
+    pso_run_step is monkeypatched, so no AIMMS is started.
+    """
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    monkeypatch.setattr(es, "pso_run_step", _honest_solver(runs))
+    common = ["--parent", str(mini_base), "--lever", "k_load",
+              "--kmin", "1.0", "--kmax", "1.2", "--kstep", "0.1",
+              "--sweeps-root", str(sweeps), "--derived-root",
+              str(tmp_path / "derived"), "--runs-root", str(runs),
+              "--sweep-id", "cli"]
+    assert es.main(["run"] + common) == 0
+    capsys.readouterr()
+
+    # Same id, different range: a refusal to START, which must not be exit 1.
+    changed = list(common)
+    changed[changed.index("1.2") - 0] = "1.4"
+    code = es.main(["run"] + changed)
+    assert code == 2, "a refusal to start is not a failed sweep"
+    assert "AMW-ERR" in capsys.readouterr().err
+
+
+def test_the_run_subcommand_returns_the_verdict_code_on_a_real_loop(
+        mini_base, tmp_path, monkeypatch, capsys):
+    """And the CLI does return non-zero when the sweep itself is broken."""
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(es, "pso_run_step", _deaf_solver(runs))
+    code = es.main(["run", "--parent", str(mini_base), "--lever", "k_load",
+                    "--kmin", "1.0", "--kmax", "1.2", "--kstep", "0.1",
+                    "--sweeps-root", str(tmp_path / "sweeps"),
+                    "--derived-root", str(tmp_path / "derived"),
+                    "--runs-root", str(runs), "--sweep-id", "cli2"])
+    assert code == 1
+    assert "did not happen" in capsys.readouterr().out
 
 
 def test_check_reports_a_bad_directory_the_way_every_other_path_does(tmp_path):

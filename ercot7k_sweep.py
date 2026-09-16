@@ -132,8 +132,10 @@ REPORT_NAME = "sweep_report.txt"
 ARTIFACTS_DIRNAME = "artifacts"
 
 # Measured on the shipped case: 190 solves, 5.7 minutes, 442 MB of results per
-# run. Used only for the projection printed before a sweep starts, and replaced
-# by the real figure as soon as one step has finished.
+# run. Used for the projection printed before a sweep starts, and superseded by
+# the measured size of the first completed step -- see enough_disk_for_step(),
+# which re-checks between steps so that a sweep stops before it fills the
+# volume rather than after.
 ESTIMATED_RUN_MB = 450.0
 ESTIMATED_RUN_MINUTES = 6.0
 
@@ -335,7 +337,12 @@ def value_text(value: float, decimals: int = DEFAULT_DECIMALS) -> str:
     text = "%.*f" % (max(0, decimals), value)
     if "." in text:
         text = text.rstrip("0").rstrip(".")
-    return text or "0"
+    if text in ("", "-0"):
+        # "-0" is what a small negative rounds to at coarse precision. It is
+        # not a value any lever should be handed, and as a directory slug it
+        # reads as a distinct step from "0" while meaning the same thing.
+        return "0"
+    return text
 
 
 def value_slug(value: float, decimals: int = DEFAULT_DECIMALS) -> str:
@@ -491,7 +498,9 @@ class SweepPlan:
         return step_slug(self.lever, value, self.slug_prefix, self.decimals)
 
     def run_name(self, index: int, value: float) -> str:
-        return "%s-%02d-%s" % (self.sweep_id, index, self.slug(value))
+        # Three digits, matching step_record_name: an operator lists these
+        # directories too, and at two digits run 100 sorts before run 99.
+        return "%s-%03d-%s" % (self.sweep_id, index, self.slug(value))
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -595,6 +604,22 @@ def assert_witness_can_see_the_lever(parent: Path, lever: str) -> None:
                      for r in static[:4])))
 
 
+def _assert_path_safe(what: str, text: str, allow_empty: bool = False) -> None:
+    if not text:
+        if allow_empty:
+            return
+        raise Ercot7kSweepError("the %s is empty" % what)
+    bad = [ch for ch in ("/", "\\", os.pardir, ":") if ch in text]
+    if bad or text.strip() != text:
+        raise Ercot7kSweepError(
+            "the %s %r is not usable as a directory name (it contains %s). It "
+            "names a directory under the sweeps root and a case layer, so it "
+            "has to be a plain name."
+            % (what, text,
+               ", ".join(repr(ch) for ch in bad) or "leading or trailing "
+               "whitespace"))
+
+
 def plan_sweep(parent: Path, lever: str, target: str, mode: str,
                kmin: float, kmax: float, kstep: float,
                sweep_id: Optional[str] = None,
@@ -622,6 +647,12 @@ def plan_sweep(parent: Path, lever: str, target: str, mode: str,
 
     if sweep_id is None:
         sweep_id = "%s-%s" % (lever, datetime.now().strftime("%Y%m%d-%H%M%S"))
+    # Both of these become directory names -- sweeps_root/<sweep_id> and the
+    # layer slug. The runner validates its own run name for separators; these
+    # went unchecked, so a stray slash would have scattered a sweep's records
+    # and layers across the filesystem.
+    _assert_path_safe("sweep id", sweep_id)
+    _assert_path_safe("slug prefix", slug_prefix, allow_empty=True)
 
     return SweepPlan(sweep_id=sweep_id, parent=parent, lever=lever,
                      target=target, mode=mode, values=values, key=key,
@@ -814,23 +845,39 @@ def run_sweep(plan: SweepPlan,
     # a different plan under the same sweep id destroys that record and leaves
     # the step files describing a sweep nobody can reconstruct, so a changed
     # plan is refused before anything is written.
+    #
+    # And a resume with NO plan file is refused outright: with nothing to be
+    # identical to, assert_plan_unchanged has nothing to say, and deleting one
+    # ordinary file would otherwise reopen the whole hole below. Resuming is a
+    # claim that this is the same sweep; without the plan that claim cannot be
+    # checked, and an unverifiable claim is not a pass.
+    if resume and not (sweep_dir / SWEEP_NAME).is_file():
+        raise Ercot7kSweepError(
+            "--resume was asked for but %s has no %s, so there is no recorded "
+            "plan to check this one against. The step records alone cannot "
+            "say which sweep they belong to. Start a fresh sweep id, or "
+            "restore the plan file." % (sweep_dir, SWEEP_NAME))
     assert_plan_unchanged(sweep_dir, plan)
     write_plan(sweep_dir, plan)
 
     outcomes: List[StepOutcome] = []
     for index, value in enumerate(plan.values, start=1):
+        rows = build_step_rows(plan.lever, plan.target, plan.mode, value,
+                               plan.decimals)
         record = sweep_dir / step_record_name(index)
         if resume and record.is_file():
             existing = outcome_from_dict(json.loads(record.read_text("ascii")))
             # The record is keyed by step INDEX, which says nothing about what
-            # that step was. Resuming a sweep whose range, target or lever has
-            # changed would otherwise report the previous run's results under
-            # the new plan's labels, with every witness check green -- and it
-            # would do so WITHOUT entering _run_one_step, so the
-            # assert_layer_matches guard below never runs. Identity is checked
-            # here or it is not checked at all.
+            # that step was, and step_slug() deliberately omits the TARGET --
+            # so slug and value together still cannot tell two k_line sweeps on
+            # different branches apart. The authority on what a layer was built
+            # from is the layer's own manifest, so the guard this path used to
+            # skip is run here instead of being reasoned around: accepting a
+            # record means accepting its layer, and that layer must match this
+            # step's stress row exactly.
             if existing.ok() and existing.slug == plan.slug(value) \
-                    and _same_value(existing.value, value, plan.decimals):
+                    and _same_value(existing.value, value, plan.decimals) \
+                    and _layer_matches(existing.layer, rows[-1]):
                 say("step %d/%d  value %s  RESUMED from %s"
                     % (index, len(plan.values), value_text(value,
                                                            plan.decimals),
@@ -838,18 +885,24 @@ def run_sweep(plan: SweepPlan,
                 outcomes.append(existing)
                 continue
             if existing.ok():
-                say("  the record in %s is step %s (%s), not this step's %s "
-                    "(%s) -- re-running rather than reporting it under the "
+                say("  the record in %s does not match this step (%s, %s on "
+                    "%r) -- re-running rather than reporting it under the "
                     "wrong label"
-                    % (record.name, value_text(existing.value, plan.decimals),
-                       existing.slug, value_text(value, plan.decimals),
-                       plan.slug(value)))
+                    % (record.name, value_text(value, plan.decimals),
+                       plan.slug(value), plan.target))
 
         say(SUBSECTION_SEPARATOR.rstrip("\n"))
         say("step %d/%d  %s=%s" % (index, len(plan.values), plan.lever,
                                    value_text(value, plan.decimals)))
+
+        if outcomes:
+            fits, why = enough_disk_for_step(
+                Path(runs_root), [o.results_mb for o in outcomes])
+            if not fits:
+                say("AMW-ERR: %s" % why)
+                break
         outcome = _run_one_step(
-            plan=plan, index=index, value=value,
+            plan=plan, index=index, value=value, rows=rows,
             derived_root=Path(derived_root), runs_root=Path(runs_root),
             artifacts_dir=artifacts_dir,
             build_fn=build_fn, run_fn=run_fn, map_fn=map_fn,
@@ -877,6 +930,7 @@ def run_sweep(plan: SweepPlan,
 
 
 def _run_one_step(plan: SweepPlan, index: int, value: float,
+                  rows: Sequence[Dict[str, str]],
                   derived_root: Path, runs_root: Path, artifacts_dir: Path,
                   build_fn: BuildFn, run_fn: RunFn,
                   map_fn: Callable[..., Any],
@@ -887,8 +941,6 @@ def _run_one_step(plan: SweepPlan, index: int, value: float,
 
     layer = derived_root / ec.layer_dir_name(plan.parent, slug)
     outcome.layer = str(layer)
-    rows = build_step_rows(plan.lever, plan.target, plan.mode, value,
-                           plan.decimals)
 
     try:
         if layer.exists():
@@ -909,6 +961,12 @@ def _run_one_step(plan: SweepPlan, index: int, value: float,
 
         run_name = plan.run_name(index, value)
         case_csv = layer / ("%s.csv" % ec.case_prefix(layer))
+        # A re-solve of this step reuses the run name, and the runner creates
+        # its results directory with exist_ok=True and clears nothing -- so a
+        # failed first attempt's files would survive and be read as this
+        # attempt's. Cleared rather than merged, and only ever this sweep's own
+        # step directory, identified by the run name this driver composed.
+        _clear_previous_attempt(Path(runs_root) / run_name, say)
         say("  solving: %s" % run_name)
         returncode, results_dir, seconds = run_fn(case_csv, run_name, runs_root)
         outcome.returncode = int(returncode)
@@ -974,6 +1032,19 @@ def _run_one_step(plan: SweepPlan, index: int, value: float,
 FIELDS = ("lever", "target", "mode", "value")
 
 
+def _layer_matches(layer_dir: str, row: Dict[str, str]) -> bool:
+    """assert_layer_matches as a predicate, for the resume-accept branch: a
+    record whose layer does not match is re-run rather than refused, because
+    unlike a fresh build there is a legitimate way forward."""
+    if not layer_dir:
+        return False
+    try:
+        assert_layer_matches(Path(layer_dir), row)
+    except Ercot7kSweepError:
+        return False
+    return True
+
+
 def assert_layer_matches(layer_dir: Path, row: Dict[str, str]) -> None:
     layer_dir = Path(layer_dir)
     if not ec.has_manifest(layer_dir):
@@ -1035,6 +1106,31 @@ def _step_figures(run: Any, key: er.ReportKey) -> Dict[str, Any]:
                 figures[column] = row[column]
         break
     return figures
+
+
+# ------------------------------------------------------------------------------
+# _clear_previous_attempt()
+#
+# Removes the results of an earlier attempt at THIS step before re-solving it.
+#
+# Guarded three ways, because it deletes: the directory must be the one this
+# driver composed the name for, it must contain a results/ subdirectory, and
+# only files under that results/ go -- the logs of the failed attempt are kept,
+# since they are the evidence of why it failed.
+# ------------------------------------------------------------------------------
+def _clear_previous_attempt(run_dir: Path,
+                            say: Callable[[str], None]) -> List[str]:
+    results = Path(run_dir) / "results"
+    if not results.is_dir():
+        return []
+    removed = [p.name for p in sorted(results.iterdir()) if p.is_file()]
+    if not removed:
+        return []
+    for name in removed:
+        (results / name).unlink()
+    say("  cleared %d file(s) left by an earlier attempt at this step; its "
+        "logs are kept" % len(removed))
+    return removed
 
 
 # ------------------------------------------------------------------------------
@@ -1109,6 +1205,8 @@ def check_sweep(plan: SweepPlan,
             "W0", ec.LEVEL_OK,
             "all %d steps completed" % len(plan.values)))
 
+    findings.append(_check_records_match_plan(plan, outcomes))
+
     if len(done) < 2:
         findings.append(ec.Finding(
             "W1", ec.LEVEL_SKIP,
@@ -1131,12 +1229,23 @@ def check_sweep(plan: SweepPlan,
                       "then carries the question of whether the limit was "
                       "actually enforced, which is the part that matters."
                       % plan.target)
+        # Severity follows W6's rule, and for the same physical reason: a
+        # corridor slack at the top of the range and binding at the bottom is
+        # the experiment worth running, and this check used to fail it with an
+        # ERROR while its own message said the absence "is NOT by itself
+        # evidence of a broken sweep". A check may not contradict its own text.
+        # No step measured at all IS a broken sweep; some steps unmeasured is a
+        # curve with holes in it, and the holes are named.
+        all_missing = len(missing) == len(done)
         findings.append(ec.Finding(
-            "W1", ec.LEVEL_ERROR,
+            "W1", ec.LEVEL_ERROR if all_missing else ec.LEVEL_WARNING,
             "%s is not reported at the pinned interval for %d of %d steps "
-            "(%s).%s"
+            "(%s), so %s.%s"
             % (witness.column, len(missing), len(done),
                ", ".join(value_text(o.value, plan.decimals) for o in missing),
+               "this sweep is unverified end to end" if all_missing
+               else "those steps are UNVERIFIED -- read their response "
+                    "columns as unchecked, not as passed",
                detail)))
     else:
         findings.append(ec.Finding(
@@ -1182,6 +1291,60 @@ def check_sweep(plan: SweepPlan,
     if len(measured) >= 2:
         findings.append(_check_enforced(plan, measured, witness))
     return findings
+
+
+# ------------------------------------------------------------------------------
+# _check_records_match_plan()  -- W7
+#
+# Does record i actually describe plan value i, and are there exactly as many
+# records as steps?
+#
+# Nothing else asks this. W0 only COUNTS completed steps, and W3 compares
+# `witness` against `witness_written` -- for an absolute lever those are two
+# fields of the SAME record, so a record the plan never asked for agrees with
+# itself perfectly and passes. That is the gap through which a resumed or
+# hand-assembled sweep directory can report values nobody requested with a
+# clean verdict, and it is also what makes `check` unable to audit a directory
+# it is simply handed.
+#
+# A proportional lever is accidentally protected, because W3's ratio test
+# notices a wrong value. Accidental protection for one of two levers is not a
+# check.
+# ------------------------------------------------------------------------------
+def _check_records_match_plan(plan: SweepPlan,
+                              outcomes: Sequence[StepOutcome]) -> ec.Finding:
+    problems: List[str] = []
+    if len(outcomes) != len(plan.values):
+        problems.append("the plan has %d steps and there are %d step records"
+                        % (len(plan.values), len(outcomes)))
+    for position, outcome in enumerate(outcomes):
+        if position >= len(plan.values):
+            problems.append("record %d (%s) has no step in the plan"
+                            % (outcome.index,
+                               value_text(outcome.value, plan.decimals)))
+            continue
+        expected = plan.values[position]
+        if not _same_value(outcome.value, expected, plan.decimals):
+            problems.append(
+                "record %d says %s where the plan says %s"
+                % (outcome.index, value_text(outcome.value, plan.decimals),
+                   value_text(expected, plan.decimals)))
+        elif outcome.slug != plan.slug(expected):
+            problems.append(
+                "record %d is slug %s where the plan's step %s is %s"
+                % (outcome.index, outcome.slug,
+                   value_text(expected, plan.decimals), plan.slug(expected)))
+    if problems:
+        return ec.Finding(
+            "W7", ec.LEVEL_ERROR,
+            "the step records do not correspond to the plan: %s. Every other "
+            "check reads these records, so until this agrees nothing below it "
+            "is about the sweep that was asked for."
+            % "; ".join(problems))
+    return ec.Finding(
+        "W7", ec.LEVEL_OK,
+        "all %d step records correspond to the plan, step for step"
+        % len(outcomes))
 
 
 # ------------------------------------------------------------------------------
@@ -1244,7 +1407,11 @@ def _check_witness_matches_input(plan: SweepPlan,
             % (witness.column, plan.lever, len(bad), "; ".join(bad)))
     return ec.Finding(
         "W3", ec.LEVEL_OK,
-        "%s scales with %s across all %d steps, referenced to %s=%s"
+        "%s scales with %s across all %d steps, referenced to %s=%s. NOTE "
+        "this is a RELATIVE check: it fixes the shape of the curve, not its "
+        "level, so a lever applied with a constant factor wrong at every step "
+        "would pass it. Only the absolute form (k_line) compares against a "
+        "number the case file states."
         % (witness.column, plan.lever, len(measured), plan.lever,
            value_text(reference.value, plan.decimals)))
 
@@ -1676,6 +1843,37 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ------------------------------------------------------------------------------
+# enough_disk_for_step()
+#
+# The between-steps disk check. `projection()` runs once, before the sweep,
+# against a 450 MB/step estimate; this runs before each later step against the
+# size the finished steps actually came to, which is the only figure that
+# knows about --prune, a shorter horizon, or a case that writes more than the
+# shipped one.
+#
+# The point is to stop with the completed steps intact. Running out of space
+# mid-solve loses the step being written AND whatever else shares the volume,
+# which on this machine includes the other repos.
+# ------------------------------------------------------------------------------
+def enough_disk_for_step(runs_root: Path,
+                         measured_mb: Sequence[float]) -> Tuple[bool, str]:
+    sizes = [mb for mb in measured_mb if mb > 0.0]
+    need = (sum(sizes) / len(sizes)) if sizes else ESTIMATED_RUN_MB
+    try:
+        free_mb = shutil.disk_usage(
+            str(_nearest_existing(runs_root))).free / (1024.0 * 1024.0)
+    except OSError:
+        return True, ""  # already reported before the sweep started
+    if free_mb - need >= DISK_MARGIN_MB:
+        return True, ""
+    return False, (
+        "only %.1f GB free at %s and the last steps averaged %.0f MB each, "
+        "which leaves less than the %.1f GB margin. Stopping here so the "
+        "completed steps survive; free space or use --prune, then --resume."
+        % (free_mb / 1024.0, runs_root, need, DISK_MARGIN_MB / 1024.0))
+
+
 def _nearest_existing(path: Path) -> Path:
     """The first ancestor that exists, so disk_usage measures the volume the
     sweep will write to rather than failing on a root two levels deep that has
@@ -1744,6 +1942,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("AMW-ERR: %s" % exc, file=sys.stderr)
             return 2
         findings = check_sweep(plan, outcomes)
+        # The summary is rewritten too. Refreshing only the report left the two
+        # artifacts in one directory disagreeing with each other, and the CSV
+        # is the one most likely to be read by something other than a human.
+        write_summary(sweep_dir, plan, outcomes)
         text = report_text(plan, outcomes, findings)
         (sweep_dir / REPORT_NAME).write_text(
             text, encoding="ascii", errors="backslashreplace")
@@ -1786,12 +1988,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   file=sys.stderr)
         return 2
 
-    outcomes = run_sweep(
-        plan, sweeps_root=sweeps_root, derived_root=derived_root,
-        runs_root=runs_root, resume=args.resume, prune=args.prune,
-        stop_on_error=not args.keep_going, echo=lambda text: print(text,
-                                                                  flush=True),
-    )
+    try:
+        outcomes = run_sweep(
+            plan, sweeps_root=sweeps_root, derived_root=derived_root,
+            runs_root=runs_root, resume=args.resume, prune=args.prune,
+            stop_on_error=not args.keep_going,
+            echo=lambda text: print(text, flush=True),
+        )
+    except (Ercot7kSweepError, ec.Ercot7kCaseError) as exc:
+        # A refusal to START is not a failed sweep, and must not share exit 1
+        # with one: nothing has been built or solved here. Everything after
+        # plan_sweep used to be outside this guard, so the refusals added for
+        # the resume identity holes surfaced as tracebacks.
+        print("AMW-ERR: %s" % exc, file=sys.stderr)
+        return 2
 
     sweep_dir = sweeps_root / plan.sweep_id
     summary = write_summary(sweep_dir, plan, outcomes)

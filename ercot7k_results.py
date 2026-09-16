@@ -411,13 +411,18 @@ def path_limit_by_interval(results_dir: Path, cycle: str, scenario: str,
                 continue
             if row[i_pth] != path_name:
                 continue
-            if i_min_enf < 0 and i_max_enf < 0:
-                enforced = math.nan
+            # Both columns absent -> unknown. Both present -> the OR. Exactly
+            # ONE present and false is still UNKNOWN, not false: the missing
+            # side could have been the enforced one, and this function's own
+            # rule is that "cannot answer" must never become "was not
+            # enforced". Only a true reading is conclusive on its own.
+            sides = [_flag(row[i]) for i in (i_min_enf, i_max_enf) if i >= 0]
+            if any(sides):
+                enforced = 1.0
+            elif len(sides) == 2:
+                enforced = 0.0
             else:
-                enforced = float(
-                    (i_min_enf >= 0 and _flag(row[i_min_enf]))
-                    or (i_max_enf >= 0 and _flag(row[i_max_enf]))
-                )
+                enforced = math.nan
             out[int(row[i_int])] = {
                 "max_mw": _num(row[i_max]),
                 "enforced": enforced,
