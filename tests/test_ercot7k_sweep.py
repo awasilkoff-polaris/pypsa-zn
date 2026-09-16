@@ -194,15 +194,49 @@ def test_a_negative_value_slug_is_directory_safe():
     assert es.value_text(-0.4, 0) == "0"
 
 
-@pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", " lead", "trail ",
-                                 "c:name"])
+@pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", ".", " lead", "trail ",
+                                 "c:name", "a*b", "a?b", "a|b", 'a"b', "a<b",
+                                 "a\tb", "a\nb"])
 def test_a_sweep_id_that_is_not_a_plain_name_is_refused(mini_base, bad):
-    """It becomes a directory under the sweeps root. The runner validates its
-    own run name; these two went unchecked."""
+    """It becomes a directory under the sweeps root. A name the validator
+    accepts and the filesystem then refuses is worse than one never checked:
+    the plan prints in full and mkdir raises after the operator has been told
+    it is fine. '.' is the nastiest -- it collapses the sweep directory onto
+    the sweeps root, scattering sweep.json and the step records."""
     with pytest.raises(es.Ercot7kSweepError, match="directory name"):
         es.plan_sweep(parent=mini_base, lever="k_load", target="",
                       mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
                       sweep_id=bad)
+
+
+@pytest.mark.parametrize("ok", ["a..b", "x..", "..y", "k_line-run.2",
+                                "sweep-1"])
+def test_a_plain_name_containing_dots_is_accepted(mini_base, ok):
+    """os.pardir was tested as a SUBSTRING, so legal names were refused."""
+    plan = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                         mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                         sweep_id=ok)
+    assert plan.sweep_id == ok
+
+
+def test_a_directory_the_filesystem_refuses_is_a_refusal_not_a_traceback(
+        mini_base, tmp_path, monkeypatch, capsys):
+    """Whatever the validator has not thought of, the filesystem has an
+    opinion about, and it must not arrive as a stack trace after the plan has
+    printed."""
+    def boom(*args, **kwargs):
+        raise OSError(123, "The filename, directory name, or volume label "
+                           "syntax is incorrect")
+
+    monkeypatch.setattr(es.Path, "mkdir", boom)
+    code = es.main(["run", "--parent", str(mini_base), "--lever", "k_load",
+                    "--kmin", "1.0", "--kmax", "1.2", "--kstep", "0.1",
+                    "--sweeps-root", str(tmp_path / "sweeps"),
+                    "--derived-root", str(tmp_path / "derived"),
+                    "--runs-root", str(tmp_path / "runs"),
+                    "--sweep-id", "fs", "--skip-disk-check"])
+    assert code == 2, "a directory that cannot be made is a refusal to start"
+    assert "AMW-ERR" in capsys.readouterr().err
 
 
 def test_run_directories_also_sort_numerically_past_ninety_nine():
@@ -1140,6 +1174,52 @@ def test_the_pin_is_found_on_an_ancestor_of_the_parent(mini_base, tmp_path):
 # ------------------------------------------------------------------------------
 #   9. Pruning -- the one irreversible thing in the driver
 # ------------------------------------------------------------------------------
+def test_a_foreign_run_directorys_results_are_refused_not_deleted(
+        mini_base, tmp_path):
+    """Composing the run name is the assumption under test, not a guard.
+
+    A run directory can outlive its layers -- a cleaned ercot7k-derived, a
+    different --derived-root, a sweep id reused after archiving -- so the
+    write-once layer check does not cover this. Someone else's 450 MB must
+    not be deleted on the strength of a name this driver made up.
+    """
+    runs = tmp_path / "runs"
+    plan = _sweep_plan_for(mini_base)
+    foreign = runs / plan.run_name(1, plan.values[0]) / "results"
+    foreign.mkdir(parents=True)
+    (foreign / "results_MC_Solution.csv").write_text("x\n", encoding="ascii")
+    (foreign / "results_PC_Nd.csv").write_text("y\n", encoding="ascii")
+
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived",
+                            runs_root=runs, run_fn=_honest_solver(runs))
+    assert not outcomes[0].ok()
+    assert "carries no marker" in outcomes[0].error
+    assert (foreign / "results_PC_Nd.csv").is_file(), "nothing was deleted"
+
+
+def test_this_sweeps_own_failed_attempt_is_cleared_on_a_re_run(
+        mini_base, tmp_path):
+    """The other half: a marker that matches means the files ARE this step's,
+    and merging into them would read a failed attempt as this one's."""
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    derived = tmp_path / "derived"
+    plan = _sweep_plan_for(mini_base)
+    es.run_sweep(plan, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_honest_solver(runs))
+
+    results = runs / plan.run_name(1, plan.values[0]) / "results"
+    (results / "results_STALE.csv").write_text("old\n", encoding="ascii")
+
+    # Re-run step 1 by invalidating only its record.
+    (sweeps / "unit" / es.step_record_name(1)).unlink()
+    es.run_sweep(plan, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_honest_solver(runs), resume=True)
+    assert not (results / "results_STALE.csv").exists(), (
+        "a stale file from the previous attempt would be read as this one's")
+
+
 def test_pruning_refuses_a_directory_that_is_not_a_results_directory(tmp_path):
     (tmp_path / "results_PC_Nd.csv").write_text("x\n", encoding="ascii")
     with pytest.raises(es.Ercot7kSweepError, match="does not look like"):
@@ -1223,17 +1303,75 @@ def test_check_re_runs_the_verdict_over_a_finished_sweep(mini_base, tmp_path):
     assert (sweeps / "unit" / es.REPORT_NAME).is_file()
 
 
-def test_the_disk_is_re_checked_between_steps_against_measured_sizes(tmp_path):
-    """The comment promised the estimate was 'replaced by the real figure as
-    soon as one step has finished'. It was not -- projection() ran once and
-    nothing re-checked, so the stated rationale (stop before filling the
-    volume) rested on a static 450 MB guess."""
+def test_check_refreshes_the_summary_as_well_as_the_report(
+        mini_base, tmp_path):
+    """Refreshing only the report left the two artifacts in one directory
+    disagreeing, and the CSV is the one a script reads."""
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    plan = _sweep_plan_for(mini_base)
+    outcomes = es.run_sweep(plan, sweeps_root=sweeps,
+                            derived_root=tmp_path / "derived", runs_root=runs,
+                            run_fn=_honest_solver(runs))
+    summary = es.write_summary(sweeps / "unit", plan, outcomes)
+    summary.write_text("stale,nonsense\n1,2\n", encoding="ascii")
+
+    assert run_cli("check", str(sweeps / "unit")).returncode == 0
+    refreshed = summary.read_text("ascii")
+    assert "stale" not in refreshed
+    assert refreshed.splitlines()[0].startswith("step,lever,target,value")
+
+
+def test_the_disk_guard_stops_the_loop_with_the_finished_steps_intact(
+        mini_base, tmp_path, monkeypatch):
+    """Drives run_sweep, not enough_disk_for_step.
+
+    The first version of this test called the helper directly and would have
+    passed with the call site deleted -- the same species of defect the review
+    raised about a test that called assert_layer_matches directly. Here the
+    volume is made to look nearly full after the first step, and the assertion
+    is on the LOOP's behaviour.
+    """
+    runs = tmp_path / "runs"
+    plan = _sweep_plan_for(mini_base)
+    real_usage = shutil.disk_usage
+
+    class Tight:
+        def __init__(self, free):
+            self.total = self.used = 0
+            self.free = free
+
+    calls = []
+
+    def fake_usage(path):
+        # Roomy until the first step has been measured, then not.
+        if calls:
+            return Tight(free=int(1024 * 1024 * 10))  # 10 MB left
+        return real_usage(path)
+
+    def counting(case_csv, run_name, root):
+        calls.append(run_name)
+        return _honest_solver(runs)(case_csv, run_name, root)
+
+    monkeypatch.setattr(es.shutil, "disk_usage", fake_usage)
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived",
+                            runs_root=runs, run_fn=counting)
+
+    assert len(calls) == 1, "the loop must stop before solving step 2"
+    assert len(outcomes) == 1, "and the finished step survives"
+    assert outcomes[0].ok()
+
+
+def test_the_disk_guard_sizes_on_the_peak_not_the_pruned_remainder(tmp_path):
+    """--prune shrinks what a step leaves behind, but the next step still
+    writes the full amount first, so sizing on the retained figure would
+    reserve about a tenth of what is needed."""
     runs = tmp_path / "runs"
     runs.mkdir()
     fits, why = es.enough_disk_for_step(runs, [10.0, 10.0])
     assert fits and why == ""
 
-    # A step measured larger than the whole volume cannot fit.
     huge = shutil.disk_usage(str(runs)).free / (1024.0 * 1024.0) + 1_000_000
     fits, why = es.enough_disk_for_step(runs, [huge])
     assert not fits
@@ -1247,6 +1385,23 @@ def test_an_unmeasurable_disk_is_not_treated_as_a_pass(tmp_path):
     projected = es.projection(plan, Path("Z:/no/such/volume"))
     assert not projected["measured"]
     assert not projected["fits"]
+
+
+def test_one_measured_step_is_unverified_and_exits_non_zero():
+    """The regression relaxing W1 to a WARNING introduced: with a single
+    measured witness the comparison checks emitted NOTHING, and
+    verdict_exit_code can only see findings that exist -- so a sweep with the
+    one check this driver exists to perform never run came out green."""
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9, 0.8))
+    outcomes = _kline_outcomes([(1, 1.0, 969.8, 969.8, 1.0),
+                                (2, 0.9, math.nan, 872.8, math.nan),
+                                (3, 0.8, math.nan, 775.8, math.nan)])
+    findings = es.check_sweep(plan, outcomes)
+    assert not ec.has_errors(findings), "W1 warns; the point is the exit code"
+    assert _levels(findings, "W2") == [ec.LEVEL_SKIP]
+    assert _levels(findings, "W3") == [ec.LEVEL_SKIP]
+    assert es.verdict_exit_code(findings) == 1, (
+        "an unverified sweep must never exit 0")
 
 
 def test_a_sweep_whose_witness_could_not_be_compared_exits_non_zero():
@@ -1288,18 +1443,18 @@ def test_the_run_subcommand_reports_a_refusal_rather_than_a_traceback(
     runs = tmp_path / "runs"
     sweeps = tmp_path / "sweeps"
     monkeypatch.setattr(es, "pso_run_step", _honest_solver(runs))
-    common = ["--parent", str(mini_base), "--lever", "k_load",
-              "--kmin", "1.0", "--kmax", "1.2", "--kstep", "0.1",
-              "--sweeps-root", str(sweeps), "--derived-root",
-              str(tmp_path / "derived"), "--runs-root", str(runs),
-              "--sweep-id", "cli"]
-    assert es.main(["run"] + common) == 0
+    def argv(kmax):
+        return ["--parent", str(mini_base), "--lever", "k_load",
+                "--kmin", "1.0", "--kmax", kmax, "--kstep", "0.1",
+                "--sweeps-root", str(sweeps), "--derived-root",
+                str(tmp_path / "derived"), "--runs-root", str(runs),
+                "--sweep-id", "cli"]
+
+    assert es.main(["run"] + argv("1.2")) == 0
     capsys.readouterr()
 
     # Same id, different range: a refusal to START, which must not be exit 1.
-    changed = list(common)
-    changed[changed.index("1.2") - 0] = "1.4"
-    code = es.main(["run"] + changed)
+    code = es.main(["run"] + argv("1.4"))
     assert code == 2, "a refusal to start is not a failed sweep"
     assert "AMW-ERR" in capsys.readouterr().err
 
