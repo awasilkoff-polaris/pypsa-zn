@@ -47,6 +47,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -1262,6 +1263,65 @@ def test_a_different_plan_reusing_the_sweep_id_does_not_delete_the_results(
     assert list(results.iterdir()), "the earlier plan's results survive"
 
 
+def test_the_digest_changes_when_any_part_of_the_plan_s_identity_changes():
+    """Table-driven over PLAN_IDENTITY so it cannot drift as the tuple grows.
+
+    Varying only the range would leave every other component free to fall out
+    of the hash unnoticed -- and `target` is the reachable one: step_slug
+    deliberately omits the target, so two k_line sweeps on different branches
+    share a run directory name exactly, and once sweep.json is gone the digest
+    is the only thing between the second and the first's results.
+    """
+    base = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    variants = {
+        "parent": {"parent": Path("somewhere-else")},
+        "lever": {"lever": "k_load"},
+        "target": {"target": "BR2"},
+        "mode": {"mode": "add"},
+        "values": {"values": [1.0, 0.8]},
+        "slug_prefix": {"slug_prefix": "v2-"},
+        "decimals": {"decimals": 3},
+        "report": {"key": er.ReportKey(cycle="RT", scenario="ScnRT",
+                                       interval=99)},
+    }
+    # Every hashed component must have a case here, or the test is not the
+    # protection it claims to be.
+    assert set(variants) == set(es.PLAN_IDENTITY) | {"report"}
+
+    for name, change in variants.items():
+        other = dataclasses.replace(base, **change)
+        assert other.identity_digest() != base.identity_digest(), (
+            "changing %s leaves the plan digest unchanged, so a sweep "
+            "differing only in %s would be treated as the same plan and "
+            "could delete its results" % (name, name))
+
+
+def test_the_digest_is_stable_for_a_plan_that_has_not_changed():
+    base = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    twin = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    assert base.identity_digest() == twin.identity_digest()
+    # sweep_id is carried by the marker separately and must NOT be hashed:
+    # the same plan under a new id is still the same plan.
+    renamed = dataclasses.replace(base, sweep_id="other")
+    assert renamed.identity_digest() == base.identity_digest()
+
+
+def test_a_slug_prefix_may_end_in_a_dot_because_it_is_never_a_whole_name(
+        mini_base):
+    """step_slug splices the prefix into the middle of the directory name, so
+    the Windows trailing-dot hazard cannot arise there -- and a dotted
+    namespace prefix is the natural thing to reach for."""
+    plan = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                         mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                         slug_prefix="v2.")
+    assert plan.slug(1.0) == "v2.k_load1"
+    # The same string is still refused for the sweep id, which IS a component.
+    with pytest.raises(es.Ercot7kSweepError, match="directory name"):
+        es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                      mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                      sweep_id="v2.")
+
+
 def test_a_nested_results_tree_is_not_treated_as_an_empty_directory(
         mini_base, tmp_path):
     """Listing only top-level files made a directory holding
@@ -1490,6 +1550,49 @@ def test_the_guard_is_handed_the_pre_prune_peak_not_the_remainder(
     assert seen[0][0] == pytest.approx(peak), (
         "the guard was sized on the retained %.4f MB, not the peak %.4f MB"
         % (retained, peak))
+
+
+def test_the_peak_survives_to_disk_and_is_what_a_resumed_guard_sees(
+        mini_base, tmp_path, monkeypatch):
+    """The sibling path, and the one the guard exists for.
+
+    A resumed sweep is exactly the case where six steps are already on disk
+    and the volume fills at step seven -- and there the peak comes back from
+    the step RECORD, not from a live measurement. Nothing read that field
+    back: zeroing it in outcome_from_dict left the whole suite passing, and
+    the `or results_mb` fallback then hands the guard the pruned remainder,
+    which is cycle-3's issue verbatim on the resume path.
+    """
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    derived = tmp_path / "derived"
+    plan = _sweep_plan_for(mini_base)
+    es.run_sweep(plan, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_honest_solver(runs), prune=True)
+
+    recorded = json.loads(
+        (sweeps / "unit" / es.step_record_name(1)).read_text("ascii"))
+    peak = recorded["peak_results_mb"]
+    assert peak > recorded["results_mb"], "the fixture must have pruned"
+
+    # Re-run only the last step, so steps 1-2 come back from their records.
+    (sweeps / "unit" / es.step_record_name(3)).unlink()
+    seen = []
+    real = es.enough_disk_for_step
+
+    def spy(runs_root, measured_mb):
+        seen.append(list(measured_mb))
+        return real(runs_root, measured_mb)
+
+    monkeypatch.setattr(es, "enough_disk_for_step", spy)
+    es.run_sweep(plan, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_honest_solver(runs), prune=True,
+                 resume=True)
+
+    assert seen, "the guard must be consulted on a resumed sweep too"
+    assert seen[0][0] == pytest.approx(peak), (
+        "a resumed step's peak must come back from its record, not collapse "
+        "to the pruned remainder")
 
 
 def test_an_unmeasurable_disk_is_not_treated_as_a_pass(tmp_path):

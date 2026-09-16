@@ -627,7 +627,17 @@ def assert_witness_can_see_the_lever(parent: Path, lever: str) -> None:
 _UNSAFE_CHARS = '<>:"/\\|?*'
 
 
-def _assert_path_safe(what: str, text: str, allow_empty: bool = False) -> None:
+def _assert_path_safe(what: str, text: str, allow_empty: bool = False,
+                      component: bool = True) -> None:
+    """
+    component=False for a value that is only ever PART of a directory name.
+
+    The trailing-dot rule is about a name Windows can strip, which requires
+    the dot to be at the END of the component. A slug prefix is spliced into
+    the middle -- step_slug returns prefix + lever + value -- so "v2." can
+    never end a directory name, and refusing it turns a natural namespace
+    prefix into an error for a hazard that cannot occur there.
+    """
     if not text:
         if allow_empty:
             return
@@ -651,7 +661,7 @@ def _assert_path_safe(what: str, text: str, allow_empty: bool = False) -> None:
     # Windows silently strips a trailing dot from a directory name, so "foo."
     # and "foo" are the same directory while reading as two sweep ids -- and
     # text.strip() does not see it.
-    if text.endswith("."):
+    if component and text.endswith("."):
         reasons.append("a trailing '.', which Windows strips, so it would "
                        "silently share a directory with the same name "
                        "without it")
@@ -694,7 +704,8 @@ def plan_sweep(parent: Path, lever: str, target: str, mode: str,
     # went unchecked, so a stray slash would have scattered a sweep's records
     # and layers across the filesystem.
     _assert_path_safe("sweep id", sweep_id)
-    _assert_path_safe("slug prefix", slug_prefix, allow_empty=True)
+    _assert_path_safe("slug prefix", slug_prefix, allow_empty=True,
+                      component=False)
 
     return SweepPlan(sweep_id=sweep_id, parent=parent, lever=lever,
                      target=target, mode=mode, values=values, key=key,
