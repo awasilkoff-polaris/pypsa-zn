@@ -343,36 +343,87 @@ def area_metrics_by_interval(results_dir: Path, cycle: str,
 # ------------------------------------------------------------------------------
 # path_limit_by_interval()
 #
-# PN_Pth.Max for ONE named path, per interval.
+# PN_Pth.Max for ONE named path, per interval, WITH the bit that says whether
+# that limit was actually in the solution.
 #
-# Max is the flow limit PSO enforced, i.e. an INPUT ECHO of BRN_ID.NormalLimit
-# as any SCN_BRN_LMT row amended it. That is what makes it the readback a
-# k_line sweep is checked against: a response variable moving proves the model
-# did something, but only an input echo proves it did what was asked. A sweep
-# whose derate never reached the solver reports the same Max at every step and
-# is otherwise indistinguishable from a network that does not respond.
+# Max is an INPUT ECHO of BRN_ID.NormalLimit as any SCN_BRN_LMT row amended it,
+# which is what makes it the readback a k_line sweep is checked against: a
+# response variable moving proves the model did something, but only an input
+# echo proves it did what was asked.
 #
-# A path that is not reported is ABSENT from the mapping, never 0.0. Only the
-# paths PSO reports appear here, and the reported set is narrower than the
-# monitored set and varies by run -- the reference run reports 1,171 per cycle
-# where our own runs report 7-9. A 0.0 would read as "limit of zero", which
-# BRN_ID.md gives a specific and opposite meaning ("if NormalLimit = 0, limits
-# are ignored"), so it is the one value that must not be invented here.
+# WARNING: Max on its own is NOT evidence that the limit reached the LP, and an
+# earlier version of this docstring said it was. PN_Pth.md is explicit: Max is
+# "(MW) maximum flow limit", while "MinEnforced and MaxEnforced identifies
+# constraints enforced in solution" -- a separate bit. The report covers "all
+# enforced paths AND any monitored paths identified for enforcement by security
+# analysis", and option "ReportAllSolvedPaths" reports every monitored path
+# "even if not identified by security analysis for enforcement".
+#
+# This is not hypothetical. In the committed reference run, which does report
+# all 1,171 monitored paths per cycle, the ordinary row is exactly
+# Max=1371.200, MaxEnforced=0, Binding=0, SolverMw=0 -- the limit echoed back
+# from the file, having played no part in dispatch. This whole case is that
+# shape: Enforce=0 on all 9,140 branches, so every limit that binds does so
+# only because CYC_SAI discovery found it.
+#
+# So `enforced` travels with max_mw, and the caller is expected to require it.
+# Without it a k_line sweep degrades into a round trip of the CSV it just
+# wrote: every step "agrees" to the digit while the derate changed nothing.
+#
+# `enforced` is MinEnforced OR MaxEnforced, and reading only the Max side
+# would be wrong. BRN_ID.NormalLimit is a "(MW) Normal BI-DIRECTIONAL limit",
+# so a derate moves Min and Max together (-NormalLimit and +NormalLimit) and
+# which side is enforced depends on the direction of flow. MEASURED on the
+# committed reference run for the study's own corridor
+# N210144_N210332_1 (HEWITT <- RIESEL), across all 168 RT intervals:
+# MinEnforced=1 168 times, MaxEnforced=1 zero times, flow -1328.300 against
+# Min -1328.300, Binding=1, SP 30.459. Reading MaxEnforced alone would call
+# the case's most persistent constraint unenforced.
+# (Consistency check while there: of 196,728 RT rows, zero are Binding with
+# neither side enforced -- so PN_Pth.md's "a path can be binding only when
+# enforced" holds, once both sides are read.)
+#
+# `enforced` is NaN, not 0, where the columns are absent: "this results set
+# cannot answer" and "the limit was not enforced" are different findings and
+# the second must not be manufactured from the first.
+#
+# A path that is not reported is ABSENT from the mapping, never 0.0 -- a 0.0
+# would read as "limit of zero", which BRN_ID.md gives a specific and opposite
+# meaning ("if NormalLimit = 0, limits are ignored").
 # ------------------------------------------------------------------------------
 def path_limit_by_interval(results_dir: Path, cycle: str, scenario: str,
-                           path_name: str) -> Dict[int, float]:
+                           path_name: str) -> Dict[int, Dict[str, float]]:
     path = require_result(results_dir, "PN_Pth")
-    out: Dict[int, float] = {}
+    columns_present = result_columns(path)
+    out: Dict[int, Dict[str, float]] = {}
     with result_reader(path) as (columns, rows):
         i_cyc, i_scn, i_pth, i_int, i_max = column_indexes(
             columns, ("cyc", "scn", "pth", "int", "Max"), path
         )
+        i_min_enf = (column_index(columns, "MinEnforced", path)
+                     if "MinEnforced" in columns_present else -1)
+        i_max_enf = (column_index(columns, "MaxEnforced", path)
+                     if "MaxEnforced" in columns_present else -1)
+        i_bind = (column_index(columns, "Binding", path)
+                  if "Binding" in columns_present else -1)
         for row in rows:
             if row[i_cyc] != cycle or row[i_scn] != scenario:
                 continue
             if row[i_pth] != path_name:
                 continue
-            out[int(row[i_int])] = _num(row[i_max])
+            if i_min_enf < 0 and i_max_enf < 0:
+                enforced = math.nan
+            else:
+                enforced = float(
+                    (i_min_enf >= 0 and _flag(row[i_min_enf]))
+                    or (i_max_enf >= 0 and _flag(row[i_max_enf]))
+                )
+            out[int(row[i_int])] = {
+                "max_mw": _num(row[i_max]),
+                "enforced": enforced,
+                "binding": (1.0 if _flag(row[i_bind]) else 0.0)
+                           if i_bind >= 0 else math.nan,
+            }
     return out
 
 

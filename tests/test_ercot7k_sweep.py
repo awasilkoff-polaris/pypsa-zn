@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -145,9 +146,43 @@ def test_a_range_that_is_not_a_whole_number_of_steps_is_refused():
         es.sweep_steps(1.0, 0.25, -0.1)
 
 
+def test_the_refusal_suggests_a_range_that_is_actually_accepted():
+    """The advice used to be a rounded kstep, which no longer divided the span
+    -- so following it reproduced the identical message. A refusal that loops
+    is worse than no advice."""
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.sweep_steps(1.0, 0.25, -0.1)
+    message = str(excinfo.value)
+    # Only the SUGGESTIONS, which are the ones followed by a step count -- the
+    # message also restates the kmax that was refused.
+    suggested = re.findall(r"kmax=([0-9.]+) \(\d+ steps\)", message)
+    assert len(suggested) == 2, message
+    for kmax in suggested:
+        # Every suggestion must be accepted by the same function, unchanged.
+        steps = es.sweep_steps(1.0, float(kmax), -0.1)
+        assert steps[-1] == float(kmax)
+
+
 def test_a_single_point_is_refused_because_the_witness_cannot_vary():
     with pytest.raises(es.Ercot7kSweepError, match="at least"):
         es.sweep_steps(1.0, 1.0, -0.1)
+
+
+@pytest.mark.parametrize("value,decimals,expected", [
+    (100.0, 0, "100"),
+    (200.0, 0, "200"),
+    (1.0, 0, "1"),
+    (10.0, 1, "10"),
+    (0.9, 4, "0.9"),
+    (1.0, 4, "1"),
+])
+def test_value_text_never_eats_a_significant_zero(value, decimals, expected):
+    """Unguarded, "%.0f" % 100.0 is "100" and rstrip("0") gives "1". That
+    string is what builds the layer, so the sweep would build, solve and
+    verify a factor of 1 while every label said 100 -- and the witness would
+    agree, because the case file would say 1 too. Latent for the two shipped
+    levers; live the moment an integer-MW lever lands."""
+    assert es.value_text(value, decimals) == expected
 
 
 def test_a_negative_value_slug_is_directory_safe():
@@ -251,7 +286,10 @@ def _area_scale(layer: Path) -> float:
 def write_fake_results(results_dir: Path, load_mw: float,
                        path_name: str = "P1",
                        limit_mw: float = 100.0,
-                       report_path: bool = True) -> None:
+                       report_path: bool = True,
+                       max_enforced: int = 1,
+                       min_enforced: int = 0,
+                       with_enforced_column: bool = True) -> None:
     """
     A two-interval run in the shape ercot7k_results.py reads.
 
@@ -280,24 +318,33 @@ def write_fake_results(results_dir: Path, load_mw: float,
           ["RT,ScnRT,NA,1,20.000", "RT,ScnRT,NA,2,30.000",
            "RT,ScnRT,NB,1,25.000", "RT,ScnRT,NB,2,90.000",
            "RT,ScnRT,Reference_0,1,20.000", "RT,ScnRT,Reference_0,2,20.000"])
-    pth_rows = []
+    # Column order follows the real results header, which carries MaxEnforced
+    # between Violation and Binding. with_enforced_column drops it, to stand
+    # for an older results set that cannot answer the enforcement question.
+    if with_enforced_column:
+        pth_header = ("cyc,scn,pth,int,Mw,Min,Max,Violation,MinEnforced,"
+                      "MaxEnforced,Binding,Penalty,SP,SAC")
+        enf = "%d,%d," % (min_enforced, max_enforced)
+    else:
+        pth_header = "cyc,scn,pth,int,Mw,Min,Max,Violation,Binding,Penalty,SP,SAC"
+        enf = ""
     if report_path:
         pth_rows = [
-            "RT,ScnRT,%s,1,50.000,-%.3f,%.3f,0.000,0,0.000,0.000,0"
-            % (path_name, limit_mw, limit_mw),
-            "RT,ScnRT,%s,2,%.3f,-%.3f,%.3f,0.000,1,0.000,17.500,1"
-            % (path_name, limit_mw, limit_mw, limit_mw),
+            "RT,ScnRT,%s,1,50.000,-%.3f,%.3f,0.000,%s0,0.000,0.000,0"
+            % (path_name, limit_mw, limit_mw, enf),
+            "RT,ScnRT,%s,2,%.3f,-%.3f,%.3f,0.000,%s1,0.000,17.500,1"
+            % (path_name, limit_mw, limit_mw, limit_mw, enf),
         ]
     else:
         # A run that reports SOME other path but not the one being swept: the
         # reporting-scope case from section 5f of the task notes.
         pth_rows = [
-            "RT,ScnRT,OTHER,1,50.000,-100.000,100.000,0.000,0,0.000,0.000,0",
-            "RT,ScnRT,OTHER,2,60.000,-100.000,100.000,0.000,0,0.000,0.000,0",
+            "RT,ScnRT,OTHER,1,50.000,-100.000,100.000,0.000,%s0,0.000,0.000,0"
+            % enf,
+            "RT,ScnRT,OTHER,2,60.000,-100.000,100.000,0.000,%s0,0.000,0.000,0"
+            % enf,
         ]
-    write("PN_Pth",
-          "cyc,scn,pth,int,Mw,Min,Max,Violation,Binding,Penalty,SP,SAC",
-          pth_rows)
+    write("PN_Pth", pth_header, pth_rows)
     write("ED_Inj",
           "cyc,scn,inj,int,P,Max,Min,LimitViolation,RampViolation,Penalty",
           ["RT,ScnRT,GEN_A,1,100.000,500.000,0.000,0.000,0.000,0.000",
@@ -310,13 +357,17 @@ def write_fake_results(results_dir: Path, load_mw: float,
 def test_the_k_load_witness_is_the_area_load_at_the_pinned_interval(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=220.0)
-    assert es.read_witness("k_load", "", results, pin()) == pytest.approx(220.0)
+    witness, enforced = es.read_witness("k_load", "", results, pin())
+    assert witness == pytest.approx(220.0)
+    assert math.isnan(enforced), "enforcement is not a question for area load"
 
 
 def test_the_k_line_witness_is_the_path_limit_at_the_pinned_interval(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0)
-    assert es.read_witness("k_line", "BR1", results, pin()) == pytest.approx(90.0)
+    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    assert witness == pytest.approx(90.0)
+    assert enforced == 1.0
 
 
 def test_an_unreported_path_is_not_measured_and_never_a_limit_of_zero(tmp_path):
@@ -325,8 +376,51 @@ def test_an_unreported_path_is_not_measured_and_never_a_limit_of_zero(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1",
                        report_path=False)
-    witness = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
     assert math.isnan(witness)
+    assert math.isnan(enforced)
+
+
+def test_a_limit_enforced_on_its_MIN_side_counts_as_enforced(tmp_path):
+    """NormalLimit is bi-directional, so which side is enforced follows the
+    direction of flow. MEASURED on the committed reference run: the study's
+    own corridor N210144_N210332_1 is MinEnforced in 168 of 168 RT intervals
+    and MaxEnforced in none, because flow runs Riesel to Hewitt against the
+    negative limit. A check reading only MaxEnforced would have called the
+    case's most persistent constraint unenforced and failed the one sweep
+    already validated by hand."""
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
+                       min_enforced=1, max_enforced=0)
+    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    assert witness == pytest.approx(90.0)
+    assert enforced == 1.0
+
+
+def test_a_limit_reported_but_not_enforced_is_read_as_not_enforced(tmp_path):
+    """PN_Pth.md: Max is the limit, MaxEnforced says whether it was in the
+    solution. The committed reference run is mostly rows of exactly this
+    shape -- the limit echoed back from the file, having played no part in
+    dispatch."""
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
+                       min_enforced=0, max_enforced=0)
+    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    assert witness == pytest.approx(90.0), "the limit is still reported"
+    assert enforced == 0.0, "but it was not in the LP on either side"
+
+
+def test_results_without_a_maxenforced_column_report_unknown_not_false(
+        tmp_path):
+    """'this results set cannot answer' and 'the limit was not enforced' are
+    different findings; manufacturing the second from the first is the whole
+    silent-failure class."""
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
+                       with_enforced_column=False)
+    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    assert witness == pytest.approx(90.0)
+    assert math.isnan(enforced)
 
 
 # ------------------------------------------------------------------------------
@@ -339,11 +433,12 @@ def _plan(lever="k_load", target="", values=(1.0, 1.1, 1.2)) -> es.SweepPlan:
     )
 
 
-def _outcome(index, value, witness, written=math.nan, status="Optimal"):
+def _outcome(index, value, witness, written=math.nan, status="Optimal",
+             enforced=math.nan):
     return es.StepOutcome(index=index, value=value,
                           slug=es.step_slug("k", value), returncode=0,
                           witness=witness, witness_written=written,
-                          status=status)
+                          witness_enforced=enforced, status=status)
 
 
 def _levels(findings, check):
@@ -431,6 +526,51 @@ def test_fewer_than_two_steps_skips_the_witness_check_and_says_so():
     assert "not a pass" in skip.message
 
 
+def test_a_limit_never_enforced_at_any_step_fails_even_though_w3_passes():
+    """W3 asks whether the results echo the case; W6 asks whether that value
+    was ever in the LP. With ReportAllSolvedPaths a k_line sweep can echo its
+    own CSV perfectly at every step while the derate changed nothing."""
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9, 0.8))
+    outcomes = [_outcome(1, 1.0, 100.0, written=100.0, enforced=0.0),
+                _outcome(2, 0.9, 90.0, written=90.0, enforced=0.0),
+                _outcome(3, 0.8, 80.0, written=80.0, enforced=0.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK], "it echoes perfectly"
+    assert _levels(findings, "W2") == [ec.LEVEL_OK], "and it does vary"
+    assert _levels(findings, "W6") == [ec.LEVEL_ERROR], "but it never bound"
+    assert ec.has_errors(findings)
+
+
+def test_a_limit_enforced_on_some_steps_warns_rather_than_failing():
+    """A corridor slack at k=1.0 and binding at k=0.8 is a GOOD sweep --
+    failing its first step would punish the experiment worth running."""
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9, 0.8))
+    outcomes = [_outcome(1, 1.0, 100.0, written=100.0, enforced=0.0),
+                _outcome(2, 0.9, 90.0, written=90.0, enforced=1.0),
+                _outcome(3, 0.8, 80.0, written=80.0, enforced=1.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W6") == [ec.LEVEL_WARNING]
+    assert not ec.has_errors(findings)
+
+
+def test_enforcement_unknown_warns_and_does_not_claim_the_lever_reached_the_lp():
+    plan = _plan(lever="k_line", target="BR1", values=(1.0, 0.9))
+    outcomes = [_outcome(1, 1.0, 100.0, written=100.0),
+                _outcome(2, 0.9, 90.0, written=90.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W6") == [ec.LEVEL_WARNING]
+    assert "MaxEnforced" in next(f.message for f in findings if f.check == "W6")
+
+
+def test_enforcement_is_not_a_question_for_a_proportional_lever():
+    plan = _plan()
+    outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
+                _outcome(3, 1.2, 240.0)]
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W6") == [ec.LEVEL_SKIP]
+    assert not ec.has_errors(findings)
+
+
 def test_a_non_optimal_step_warns_rather_than_failing():
     plan = _plan()
     outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
@@ -513,11 +653,18 @@ def test_each_step_is_recorded_as_it_finishes(mini_base, tmp_path):
     sweep_dir = sweeps / "unit"
     assert (sweep_dir / es.SWEEP_NAME).is_file()
     records = sorted(sweep_dir.glob("step_*.json"))
-    assert [p.name for p in records] == ["step_01.json", "step_02.json",
-                                         "step_03.json"]
+    assert [p.name for p in records] == ["step_001.json", "step_002.json",
+                                         "step_003.json"]
     payload = json.loads(records[1].read_text("ascii"))
     assert payload["value"] == 1.1
     assert payload["witness"] == pytest.approx(220.0)
+
+
+def test_step_records_sort_numerically_past_ninety_nine():
+    """At two digits step_100 sorts before step_99 and read_outcomes silently
+    reorders the curve. A 17-step sweep is already among the presets."""
+    names = [es.step_record_name(i) for i in (9, 10, 99, 100, 101)]
+    assert names == sorted(names)
 
 
 def test_a_resume_reuses_finished_steps_and_does_not_resolve_them(
@@ -560,6 +707,67 @@ def test_a_second_sweep_over_the_same_layers_is_refused_without_resume(
                             run_fn=_honest_solver(runs))
     assert not outcomes[0].ok()
     assert "already exists" in outcomes[0].error
+
+
+def test_a_resume_with_a_changed_range_does_not_report_the_old_values(
+        mini_base, tmp_path):
+    """The severe one. Step records are keyed by INDEX, which says nothing
+    about what the step was. Resuming a changed plan under the same sweep id
+    once replayed the previous run's witnesses under the new plan's labels,
+    solved nothing, and returned an all-green verdict."""
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    derived = tmp_path / "derived"
+    first = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                          mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
+                          sweep_id="unit")
+    es.run_sweep(first, sweeps_root=sweeps, derived_root=derived,
+                 runs_root=runs, run_fn=_honest_solver(runs))
+
+    second = es.plan_sweep(parent=mini_base, lever="k_load", target="",
+                           mode="scale", kmin=1.0, kmax=1.4, kstep=0.2,
+                           sweep_id="unit")
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.run_sweep(second, sweeps_root=sweeps, derived_root=derived,
+                     runs_root=runs, run_fn=_honest_solver(runs), resume=True)
+    assert "already records a different sweep" in str(excinfo.value)
+    assert "values" in str(excinfo.value)
+
+    # And the record of what was originally asked for survives.
+    assert es.read_plan(sweeps / "unit").values == [1.0, 1.1, 1.2]
+
+
+def test_a_resume_re_runs_a_step_whose_record_is_for_a_different_value(
+        mini_base, tmp_path):
+    """Belt to the plan guard's braces: even reaching the loop with a
+    mismatched record, the step is re-run rather than reported under the wrong
+    label. Index alone is not identity."""
+    runs = tmp_path / "runs"
+    sweeps = tmp_path / "sweeps"
+    plan = _sweep_plan_for(mini_base)
+    es.run_sweep(plan, sweeps_root=sweeps, derived_root=tmp_path / "derived",
+                 runs_root=runs, run_fn=_honest_solver(runs))
+
+    # Doctor step 2's record so it claims to be a value this plan never asked
+    # for, exactly as a changed range would have left it.
+    record = sweeps / "unit" / es.step_record_name(2)
+    payload = json.loads(record.read_text("ascii"))
+    payload["value"] = 1.9
+    payload["slug"] = es.step_slug("k_load", 1.9)
+    record.write_text(json.dumps(payload), encoding="ascii")
+
+    calls = []
+
+    def counting(case_csv, run_name, root):
+        calls.append(run_name)
+        return _honest_solver(runs)(case_csv, run_name, root)
+
+    outcomes = es.run_sweep(plan, sweeps_root=sweeps,
+                            derived_root=tmp_path / "derived",
+                            runs_root=runs, run_fn=counting, resume=True)
+    assert len(calls) == 1, "only the mismatched step is re-run"
+    assert [o.value for o in outcomes] == [1.0, 1.1, 1.2]
+    assert outcomes[1].witness == pytest.approx(220.0)
 
 
 def test_a_resume_refuses_a_layer_built_for_a_different_target(
@@ -654,15 +862,27 @@ def test_the_runner_closes_stdin_rather_than_feeding_it_canned_answers(
     assert seen["stdin"] == subprocess.DEVNULL
 
 
-def test_the_runner_actually_reads_the_runs_root_variable():
-    """A cross-file contract with no shared symbol: the driver sets the
-    variable and the runner reads it. Nothing else fails if the runner stops
-    reading it -- the sweep just looks in the wrong directory -- so the two
-    sides are pinned together here."""
+def test_the_runner_source_still_reads_the_batch_overrides():
+    """A SOURCE-level pin, and deliberately labelled as one.
+
+    A behavioural test is not available: ercot7k_pso.py executes at import, and
+    driving it far enough as a subprocess to print its resolved results
+    directory means passing the aimmspy gate -- at which point, with
+    DEVNET_PSO_ASSUME_YES set, it opens AIMMS and takes the machine's only
+    licence seat for six minutes. No test may do that.
+
+    So this pins the READ rather than the mention. An earlier version asserted
+    the three variable names appeared anywhere in the file, which the comment
+    block added alongside them satisfied on its own -- every os.environ.get
+    could have been deleted and it would still have passed.
+    """
     source = (REPO_ROOT / "ercot7k_pso.py").read_text(encoding="utf-8")
-    assert "DEVNET_PSO_RUNS_ROOT" in source
-    assert "DEVNET_PSO_RUN_NAME" in source
-    assert "DEVNET_PSO_ASSUME_YES" in source
+    for name in ("DEVNET_PSO_RUNS_ROOT", "DEVNET_PSO_RUN_NAME",
+                 "DEVNET_PSO_ASSUME_YES"):
+        assert 'os.environ.get("%s"' % name in source, (
+            "%s is mentioned but never read" % name)
+    assert "os.path.join(RUNS_ROOT, RUN_NAME)" in source, (
+        "the runs root is read but not used to place the run")
 
 
 # ------------------------------------------------------------------------------
@@ -681,7 +901,7 @@ def test_the_summary_leads_with_what_was_asked_and_what_came_back(
     text = path.read_text("ascii")
     header = text.splitlines()[0].split(",")
     assert header[:8] == ["step", "lever", "target", "value", "witness",
-                          "witness_written", "witness_column", "witness_ok"]
+                          "witness_expected", "witness_column", "witness_ok"]
     assert "lmp_spread_p95_p05" in header
     assert "lmp_spread_maxmin" in header, (
         "both definitions are carried; the campaign measured max-min moving "
@@ -753,7 +973,8 @@ def test_pruning_keeps_the_tables_the_costs_are_re_derivable_from(tmp_path):
         assert (results / ("results_%s.csv" % name)).is_file()
     # Still readable for the two figures the summary stands on.
     assert er.objective_by_cycle(results)["RT"] == pytest.approx(3000.0)
-    assert es.read_witness("k_load", "", results, pin()) == pytest.approx(200.0)
+    witness, _ = es.read_witness("k_load", "", results, pin())
+    assert witness == pytest.approx(200.0)
 
 
 # ------------------------------------------------------------------------------
@@ -816,6 +1037,49 @@ def test_check_re_runs_the_verdict_over_a_finished_sweep(mini_base, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "W2" in result.stdout
     assert (sweeps / "unit" / es.REPORT_NAME).is_file()
+
+
+def test_an_unmeasurable_disk_is_not_treated_as_a_pass(tmp_path):
+    """The module says in several places that a SKIP is not a pass; its own
+    disk guard used to return 'fits' when free space could not be read."""
+    plan = _plan()
+    projected = es.projection(plan, Path("Z:/no/such/volume"))
+    assert not projected["measured"]
+    assert not projected["fits"]
+
+
+def test_a_sweep_whose_witness_could_not_be_compared_exits_non_zero():
+    """An unverified sweep must not be green to anything reading only the exit
+    status, or the 'a SKIP is not a pass' wording is decoration.
+
+    A one-value plan is the reachable shape: plan_sweep refuses it, but
+    check_sweep also runs over a hand-written or hand-edited sweep.json.
+    """
+    plan = _plan(values=(1.0,))
+    findings = es.check_sweep(plan, [_outcome(1, 1.0, 200.0)])
+    assert not ec.has_errors(findings), "every step completed -- no ERROR"
+    assert _levels(findings, "W1") == [ec.LEVEL_SKIP]
+    assert es.verdict_exit_code(findings) == 1
+
+
+def test_a_clean_sweep_exits_zero():
+    plan = _plan()
+    outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
+                _outcome(3, 1.2, 240.0)]
+    assert es.verdict_exit_code(es.check_sweep(plan, outcomes)) == 0
+
+
+def test_a_truncated_step_record_names_the_problem_rather_than_keyerroring(
+        tmp_path):
+    with pytest.raises(es.Ercot7kSweepError, match="truncated"):
+        es.outcome_from_dict({"index": 1})
+
+
+def test_check_reports_a_bad_directory_the_way_every_other_path_does(tmp_path):
+    result = run_cli("check", str(tmp_path / "not-a-sweep"))
+    assert result.returncode == 2
+    assert "AMW-ERR" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_check_exits_non_zero_on_a_sweep_that_did_not_happen(

@@ -283,15 +283,21 @@ def sweep_steps(kmin: float, kmax: float, kstep: float,
     count = int(round(exact))
     if count < 1 or abs(exact - count) > 1e-9:
         low = max(1, int(math.floor(exact)))
-        high = int(math.ceil(exact))
+        high = max(low + 1, int(math.ceil(exact)))
+        # Suggest KMAX values, not step sizes. A suggested step is rounded to
+        # `decimals` and the rounded value no longer divides the span, so
+        # following that advice reproduces this very message -- a refusal that
+        # loops. kmin + n*kstep is always reachable by construction.
         raise Ercot7kSweepError(
             "kmin=%s kmax=%s kstep=%s is not a whole number of steps "
             "(%.6f of them). np.arange would truncate this and report a sweep "
-            "that never reached kmax. Use %d steps (kstep=%s) or %d steps "
-            "(kstep=%s), or move kmax."
+            "that never reached kmax. Keep this kstep and use kmax=%s (%d "
+            "steps) or kmax=%s (%d steps), or change kstep."
             % (kmin, kmax, kstep, exact,
-               low, _round(span / low, decimals),
-               high, _round(span / high, decimals)))
+               value_text(_round(kmin + low * kstep, decimals), decimals),
+               low + 1,
+               value_text(_round(kmin + high * kstep, decimals), decimals),
+               high + 1))
 
     values = [_round(kmin + index * kstep, decimals)
               for index in range(count + 1)]
@@ -316,8 +322,19 @@ def _round(value: float, decimals: int) -> float:
 
 
 def value_text(value: float, decimals: int = DEFAULT_DECIMALS) -> str:
-    """The step value as it goes into the config row: no trailing zero noise."""
-    text = ("%.*f" % (decimals, value)).rstrip("0").rstrip(".")
+    """
+    The step value as it goes into the config row: no trailing zero noise.
+
+    The strip is guarded on a decimal point being present, which is not
+    pedantry. Unguarded, "%.0f" % 100.0 is "100" and rstrip("0") eats the
+    significant zeros, giving "1" -- and since this string is what
+    build_step_rows puts into the layer, the sweep would build, solve and
+    verify a factor of 1 while every label said 100. The witness would agree
+    with the case file perfectly, because the case file would also say 1.
+    """
+    text = "%.*f" % (max(0, decimals), value)
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
@@ -370,18 +387,41 @@ def build_step_rows(lever: str, target: str, mode: str, value: float,
 # the one value that must never be invented.
 # ------------------------------------------------------------------------------
 def read_witness(lever: str, target: str, results_dir: Path,
-                 key: er.ReportKey) -> float:
+                 key: er.ReportKey) -> Tuple[float, float]:
+    """
+    Returns (witness, enforced) at the pinned interval.
+
+    enforced is 1.0 / 0.0 / NaN-for-unknown, and it is the second half of the
+    claim. For k_line the witness is PN_Pth.Max, which PN_Pth.md defines as the
+    maximum flow LIMIT -- an echo of the case file -- while enforcement is a
+    separate bit. The committed reference run is full of rows reading
+    Max=1371.200 with neither side enforced: the limit reported back with no
+    part in dispatch. Without the bit, a k_line sweep can round-trip the CSV it
+    just wrote and agree with itself to the digit.
+
+    "Enforced" means MinEnforced OR MaxEnforced, because NormalLimit is
+    bi-directional -- see path_limit_by_interval, where the study's own
+    corridor is measured binding on Min in all 168 intervals and on Max in
+    none.
+
+    k_load has no equivalent question -- area load is consumed by the power
+    balance unconditionally -- so it reports enforcement as NaN, meaning "not
+    applicable", and W6 skips it by lever kind rather than by value.
+    """
     witness_for(lever)  # refuses an unsweepable lever before touching the disk
     results_dir = Path(results_dir)
     if lever == "k_line":
         limits = er.path_limit_by_interval(results_dir, key.cycle,
                                            key.scenario, target)
-        return limits.get(key.interval, math.nan)
+        entry = limits.get(key.interval)
+        if entry is None:
+            return math.nan, math.nan
+        return entry["max_mw"], entry["enforced"]
     if lever == "k_load":
         metrics = er.area_metrics_by_interval(results_dir, key.cycle,
                                               key.scenario)
         entry = metrics.get(key.interval)
-        return entry["load_mw"] if entry else math.nan
+        return (entry["load_mw"] if entry else math.nan), math.nan
     raise Ercot7kSweepError(
         "lever %s is in WITNESSES but read_witness() has no branch for it"
         % lever)
@@ -510,6 +550,51 @@ def resolve_pin(case_dir: Path) -> Tuple[er.ReportKey, Path]:
                    chain[0].path))
 
 
+# ------------------------------------------------------------------------------
+# assert_witness_can_see_the_lever()
+#
+# Checked at PLAN time, before an hour of solving, because the failure it
+# catches would surface as a W3 error blaming the lever for something the
+# witness cannot observe.
+#
+# SCN_ARA_LOD.md gives the priority Sequence > Schedule > static Load, and says
+# ScaleFactor is "applied to Schedule and Sequence" -- NOT to the static Load
+# field. So an area whose load comes from the static field is not scaled by
+# k_load at all, while ED_Ara.Load still reports it. On a case mixing the two,
+# the witness would move by less than the lever and W3 would call the sweep
+# broken when the lever applied exactly as documented to everything it can
+# reach.
+#
+# The shipped case is clean -- both SCN_ARA_LOD rows carry a schedule and a
+# blank Load -- so this is a guard against the case changing, which is why it
+# names the rows rather than just refusing.
+# ------------------------------------------------------------------------------
+def assert_witness_can_see_the_lever(parent: Path, lever: str) -> None:
+    if lever != "k_load":
+        return
+    parent = Path(parent)
+    prefix = ec.case_prefix(parent)
+    path = parent / ("%s_SCN_ARA_LOD.csv" % prefix)
+    if not path.is_file():
+        return
+    static = [record for record in ec.read_table(path).records()
+              if (record.get("Load") or "").strip()]
+    if not static:
+        return
+    raise Ercot7kSweepError(
+        "%s has %d row(s) carrying a static Load (%s). SCN_ARA_LOD.md: "
+        "ScaleFactor is applied to Schedule and Sequence, not to the static "
+        "Load field, so k_load would leave those rows unscaled while "
+        "ED_Ara.Load still reports them -- the witness would move by less "
+        "than the lever and W3 would report a broken sweep for a lever that "
+        "applied correctly to everything it can reach. Drive that area's load "
+        "from a schedule, or sweep something else."
+        % (path.name, len(static),
+           ", ".join("scenario %s area %s" % (r.get("Scenario", ""),
+                                              r.get("Area", ""))
+                     for r in static[:4])))
+
+
 def plan_sweep(parent: Path, lever: str, target: str, mode: str,
                kmin: float, kmax: float, kstep: float,
                sweep_id: Optional[str] = None,
@@ -531,6 +616,7 @@ def plan_sweep(parent: Path, lever: str, target: str, mode: str,
             "lever %s needs a %s as its target: %s"
             % (lever, entry["target"], entry["note"]))
 
+    assert_witness_can_see_the_lever(parent, lever)
     values = sweep_steps(kmin, kmax, kstep, decimals)
     key, pinned_by = resolve_pin(parent)
 
@@ -560,6 +646,7 @@ class StepOutcome:
     results_mb: float = 0.0
     witness: float = math.nan
     witness_written: float = math.nan
+    witness_enforced: float = math.nan
     status: str = ""
     solves: int = 0
     figures: Dict[str, Any] = field(default_factory=dict)
@@ -579,8 +666,8 @@ class StepOutcome:
             key: _jsonable(getattr(self, key))
             for key in ("index", "value", "slug", "layer", "run_dir",
                         "results_dir", "returncode", "seconds", "results_mb",
-                        "witness", "witness_written", "status", "solves",
-                        "figures", "pruned", "error")
+                        "witness", "witness_written", "witness_enforced",
+                        "status", "solves", "figures", "pruned", "error")
         })
         return payload
 
@@ -602,6 +689,16 @@ def _from_json(value: Any) -> float:
 
 
 def outcome_from_dict(payload: Dict[str, Any]) -> StepOutcome:
+    # A step record truncated mid-write (power loss, a full disk) would
+    # otherwise raise a bare KeyError out of --resume or `check`, naming
+    # nothing. The three required keys are named here so the message points at
+    # the file to delete.
+    missing = [key for key in ("index", "value", "slug") if key not in payload]
+    if missing:
+        raise Ercot7kSweepError(
+            "a step record is missing %s, so it cannot be read. It was "
+            "probably truncated mid-write; delete it and let --resume re-run "
+            "that step." % ", ".join(missing))
     return StepOutcome(
         index=int(payload["index"]),
         value=float(payload["value"]),
@@ -614,6 +711,7 @@ def outcome_from_dict(payload: Dict[str, Any]) -> StepOutcome:
         results_mb=float(payload.get("results_mb", 0.0)),
         witness=_from_json(payload.get("witness")),
         witness_written=_from_json(payload.get("witness_written")),
+        witness_enforced=_from_json(payload.get("witness_enforced")),
         status=payload.get("status", ""),
         solves=int(payload.get("solves", 0)),
         figures=payload.get("figures", {}),
@@ -712,20 +810,40 @@ def run_sweep(plan: SweepPlan,
     sweep_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir = sweep_dir / ARTIFACTS_DIRNAME
     artifacts_dir.mkdir(exist_ok=True)
+    # sweep.json is the only record of what was ASKED for. Overwriting it with
+    # a different plan under the same sweep id destroys that record and leaves
+    # the step files describing a sweep nobody can reconstruct, so a changed
+    # plan is refused before anything is written.
+    assert_plan_unchanged(sweep_dir, plan)
     write_plan(sweep_dir, plan)
 
     outcomes: List[StepOutcome] = []
     for index, value in enumerate(plan.values, start=1):
-        record = sweep_dir / ("step_%02d.json" % index)
+        record = sweep_dir / step_record_name(index)
         if resume and record.is_file():
             existing = outcome_from_dict(json.loads(record.read_text("ascii")))
-            if existing.ok():
+            # The record is keyed by step INDEX, which says nothing about what
+            # that step was. Resuming a sweep whose range, target or lever has
+            # changed would otherwise report the previous run's results under
+            # the new plan's labels, with every witness check green -- and it
+            # would do so WITHOUT entering _run_one_step, so the
+            # assert_layer_matches guard below never runs. Identity is checked
+            # here or it is not checked at all.
+            if existing.ok() and existing.slug == plan.slug(value) \
+                    and _same_value(existing.value, value, plan.decimals):
                 say("step %d/%d  value %s  RESUMED from %s"
                     % (index, len(plan.values), value_text(value,
                                                            plan.decimals),
                        record.name))
                 outcomes.append(existing)
                 continue
+            if existing.ok():
+                say("  the record in %s is step %s (%s), not this step's %s "
+                    "(%s) -- re-running rather than reporting it under the "
+                    "wrong label"
+                    % (record.name, value_text(existing.value, plan.decimals),
+                       existing.slug, value_text(value, plan.decimals),
+                       plan.slug(value)))
 
         say(SUBSECTION_SEPARATOR.rstrip("\n"))
         say("step %d/%d  %s=%s" % (index, len(plan.values), plan.lever,
@@ -737,8 +855,16 @@ def run_sweep(plan: SweepPlan,
             build_fn=build_fn, run_fn=run_fn, map_fn=map_fn,
             resume=resume, prune=prune, say=say,
         )
+        # backslashreplace, not plain encode: outcome.error carries an
+        # exception message and outcome.layer/run_dir carry filesystem paths,
+        # either of which can hold a non-ASCII byte (a library's smart quote, a
+        # non-ASCII username). A UnicodeEncodeError raised HERE, outside
+        # _run_one_step's try, would throw away a six-minute solve along with
+        # the record of it and leave nothing for --resume to find. The file
+        # stays ASCII; the odd byte arrives escaped instead of fatal.
         record.write_bytes(
-            (json.dumps(outcome.as_dict(), indent=2) + "\n").encode("ascii"))
+            (json.dumps(outcome.as_dict(), indent=2) + "\n")
+            .encode("ascii", "backslashreplace"))
         outcomes.append(outcome)
 
         if not outcome.ok() and stop_on_error:
@@ -799,13 +925,14 @@ def _run_one_step(plan: SweepPlan, index: int, value: float,
         # The witness comes FIRST, before anything derived from the run. If the
         # lever did not reach the solver, every other number in this row is a
         # correct measurement of the wrong case.
-        outcome.witness = read_witness(plan.lever, plan.target, results_dir,
-                                       plan.key)
+        outcome.witness, outcome.witness_enforced = read_witness(
+            plan.lever, plan.target, results_dir, plan.key)
         outcome.witness_written = written_witness(plan.lever, plan.target,
                                                   layer)
-        say("  witness %s = %s %s (layer wrote %s)"
+        say("  witness %s = %s %s (layer wrote %s)%s"
             % (WITNESSES[plan.lever].column, _fmt(outcome.witness),
-               WITNESSES[plan.lever].unit, _fmt(outcome.witness_written)))
+               WITNESSES[plan.lever].unit, _fmt(outcome.witness_written),
+               _enforced_text(plan.lever, outcome.witness_enforced)))
 
         run = map_fn(results_dir, interval=plan.key.interval,
                      cycle=plan.key.cycle, scenario=plan.key.scenario,
@@ -949,7 +1076,7 @@ def _dir_mb(path: Path) -> float:
     path = Path(path)
     if not path.is_dir():
         return 0.0
-    total = sum(p.stat().st_size for p in path.iterdir() if p.is_file())
+    total = sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
     return total / (1024.0 * 1024.0)
 
 
@@ -993,12 +1120,17 @@ def check_sweep(plan: SweepPlan,
     if missing:
         detail = ""
         if plan.lever == "k_line":
-            detail = (" The likeliest cause is the reporting scope: a run "
-                      "reports only some of the monitored paths (the reference "
-                      "run reports 1,171 per cycle, our own runs report 7-9), "
-                      "so branch %r may not be in PN_Pth at all. Without the "
-                      "witness this sweep cannot show that the derate was "
-                      "applied." % plan.target)
+            detail = (" The cause is the reporting scope: PN_Pth covers "
+                      "enforced paths plus those security analysis identified "
+                      "for enforcement, so branch %r is absent from any "
+                      "interval where it was slack -- which is expected on a "
+                      "step that does not derate it far enough to bind, and "
+                      "is NOT by itself evidence of a broken sweep. The "
+                      "documented remedy is PSO's ReportAllSolvedPaths option "
+                      "(PN_Pth.md), which reports every monitored path; W6 "
+                      "then carries the question of whether the limit was "
+                      "actually enforced, which is the part that matters."
+                      % plan.target)
         findings.append(ec.Finding(
             "W1", ec.LEVEL_ERROR,
             "%s is not reported at the pinned interval for %d of %d steps "
@@ -1046,6 +1178,9 @@ def check_sweep(plan: SweepPlan,
     elif statuses:
         findings.append(ec.Finding(
             "W5", ec.LEVEL_OK, "every step solved Optimal"))
+
+    if len(measured) >= 2:
+        findings.append(_check_enforced(plan, measured, witness))
     return findings
 
 
@@ -1115,6 +1250,94 @@ def _check_witness_matches_input(plan: SweepPlan,
 
 
 # ------------------------------------------------------------------------------
+# _check_enforced()  -- W6
+#
+# W3 asks whether the results echo the value the case asked for. W6 asks the
+# question W3 cannot: was that value ever actually in the LP?
+#
+# For k_line the two are genuinely separable, and the gap is not theoretical.
+# PN_Pth.Max is the limit; MinEnforced/MaxEnforced say whether it was enforced.
+# This case carries Enforce=0 on all 9,140 branches, so nothing is enforced
+# except what CYC_SAI discovery finds -- and the committed reference run, which
+# reports all 1,171 monitored paths, is mostly rows of Max=<the file's number>
+# with neither side enforced and SolverMw=0. Turn on ReportAllSolvedPaths (the
+# documented fix for this study's open reporting-scope question) and every step
+# of a k_line sweep would report its derated limit, agree with the layer to the
+# digit, and mean nothing. W3 would be green on a sweep with no effect whatever.
+#
+# WARNING, paid for: read BOTH sides. The first version of this check tested
+# MaxEnforced alone, and measured against the reference run that would have
+# raised ERROR on the study's flagship corridor -- N210144_N210332_1 is
+# enforced on Min in 168 of 168 RT intervals and on Max in none, because the
+# flow runs Riesel to Hewitt and binds against the negative limit. A check that
+# fails the one sweep already validated by hand is worse than no check.
+#
+# The rule is per-sweep rather than per-step, deliberately. A corridor that is
+# slack at k=1.0 and binds at k=0.8 is a GOOD sweep, and failing its first step
+# would punish exactly the experiment worth running. What cannot be tolerated
+# is a sweep where the limit was enforced at no step at all: there the lever
+# moved a number that never reached the solver.
+# ------------------------------------------------------------------------------
+def _check_enforced(plan: SweepPlan, measured: Sequence[StepOutcome],
+                    witness: Witness) -> ec.Finding:
+    if witness.kind != "absolute":
+        return ec.Finding(
+            "W6", ec.LEVEL_SKIP,
+            "%s is consumed unconditionally by the power balance, so there is "
+            "no separate 'was it enforced' question for %s"
+            % (witness.column, plan.lever))
+
+    known = [o for o in measured if _finite(o.witness_enforced)]
+    if not known:
+        return ec.Finding(
+            "W6", ec.LEVEL_WARNING,
+            "these results carry no MinEnforced/MaxEnforced column, so "
+            "whether the derated limit actually entered the LP cannot be "
+            "established. %s on its own is an echo of the case file. Treat W3 "
+            "as proof that the case was written, not that it was solved."
+            % witness.column)
+
+    enforced = [o for o in known if o.witness_enforced == 1.0]
+    if not enforced:
+        return ec.Finding(
+            "W6", ec.LEVEL_ERROR,
+            "%s was reported at every step but the limit was enforced at "
+            "NEITHER bound at ALL %d of them, so the limit this sweep derates "
+            "was never in the solution. The steps agree with the case file and "
+            "changed nothing: on this case Enforce=0 on every branch, so a "
+            "limit only reaches the LP if CYC_SAI discovery identifies it. "
+            "Pick a corridor that binds, or derate far enough that it does."
+            % (witness.column, len(known)))
+
+    slack = [o for o in known if o.witness_enforced != 1.0]
+    if slack:
+        return ec.Finding(
+            "W6", ec.LEVEL_WARNING,
+            "the derated limit was enforced at %d of %d measured steps; not "
+            "enforced at %s. Those steps are consistent with the case file but "
+            "did not constrain the solution, which is expected where the "
+            "corridor is still slack -- read their response columns as "
+            "unchanged by the lever rather than as a response to it."
+            % (len(enforced), len(known),
+               ", ".join("%s=%s" % (plan.lever,
+                                    value_text(o.value, plan.decimals))
+                         for o in slack)))
+    return ec.Finding(
+        "W6", ec.LEVEL_OK,
+        "the derated limit was enforced in the solution at all %d measured "
+        "steps, so %s is evidence the lever reached the LP and not only the "
+        "case file" % (len(enforced), witness.column))
+
+
+def _enforced_text(lever: str, enforced: float) -> str:
+    if WITNESSES[lever].kind != "absolute":
+        return ""
+    if not _finite(enforced):
+        return "  [enforced: unknown -- no MaxEnforced column]"
+    return "  [enforced: %s]" % ("yes" if enforced == 1.0 else "NO")
+
+
+# ------------------------------------------------------------------------------
 # _check_monotone()  -- W4
 #
 # Both witnesses are a positive multiple of the lever value, so the readback
@@ -1151,7 +1374,12 @@ def _check_monotone(plan: SweepPlan, measured: Sequence[StepOutcome],
 # stops after four columns has still seen whether the sweep happened.
 LEAD_COLUMNS: Tuple[str, ...] = (
     "step", "lever", "target", "value",
-    "witness", "witness_written", "witness_column", "witness_ok",
+    # witness_expected, not witness_written: for an absolute lever it IS what
+    # the layer wrote, but for a proportional one it is a value computed from
+    # the reference step, and a column named "written" would be read as
+    # provenance it does not have.
+    "witness", "witness_expected", "witness_column", "witness_ok",
+    "witness_enforced",
     "status", "solves", "seconds", "results_mb",
 )
 TAIL_COLUMNS: Tuple[str, ...] = ("layer", "run_dir", "error")
@@ -1176,9 +1404,10 @@ def summary_rows(plan: SweepPlan,
             "target": plan.target,
             "value": outcome.value,
             "witness": outcome.witness,
-            "witness_written": expected,
+            "witness_expected": expected,
             "witness_column": witness.column,
             "witness_ok": int(_close(outcome.witness, expected)),
+            "witness_enforced": outcome.witness_enforced,
             "status": outcome.status,
             "solves": outcome.solves,
             "seconds": round(outcome.seconds, 1),
@@ -1211,6 +1440,48 @@ def write_plan(sweep_dir: Path, plan: SweepPlan) -> Path:
     text = json.dumps(plan.as_dict(), indent=2)
     path.write_bytes((text + "\n").encode("ascii"))
     return path
+
+
+# The identity of a sweep: change any of these and the step records already on
+# disk describe something else. Cost and cosmetic fields (slug_prefix aside,
+# which changes directory names) are deliberately not in here.
+PLAN_IDENTITY = ("parent", "lever", "target", "mode", "values", "slug_prefix",
+                 "decimals")
+
+
+def assert_plan_unchanged(sweep_dir: Path, plan: SweepPlan) -> None:
+    """Refuses to reuse a sweep id whose recorded plan differs from this one."""
+    path = Path(sweep_dir) / SWEEP_NAME
+    if not path.is_file():
+        return
+    try:
+        recorded = read_plan(path.parent).as_dict()
+    except Ercot7kSweepError:
+        raise
+    current = plan.as_dict()
+    differs = [key for key in PLAN_IDENTITY if recorded.get(key) != current.get(key)]
+    if recorded.get("report") != current.get("report"):
+        differs.append("report")
+    if not differs:
+        return
+    raise Ercot7kSweepError(
+        "sweep id %r already records a different sweep, differing in: %s. "
+        "Reusing the id would overwrite %s -- the only record of what was "
+        "asked for -- and, on --resume, report the earlier run's results "
+        "under this plan's labels with every witness check passing. Use a new "
+        "--sweep-id, or delete %s if the earlier sweep is finished with."
+        % (plan.sweep_id, ", ".join(differs), SWEEP_NAME, sweep_dir))
+
+
+def step_record_name(index: int) -> str:
+    """Three digits so a lexicographic sort of step_*.json stays numeric: at
+    two, step_100 sorts before step_99 and read_outcomes silently reorders the
+    curve. A 17-step sweep is already among the devnet presets."""
+    return "step_%03d.json" % index
+
+
+def _same_value(left: float, right: float, decimals: int) -> bool:
+    return _round(left, decimals) == _round(right, decimals)
 
 
 def read_plan(sweep_dir: Path) -> SweepPlan:
@@ -1274,7 +1545,7 @@ def report_text(plan: SweepPlan, outcomes: Sequence[StepOutcome],
     for row in summary_rows(plan, outcomes):
         lines.append("%-6d %-12s %-14s %-14s %-9s %8.1f"
                      % (row["step"], value_text(row["value"], plan.decimals),
-                        _fmt(row["witness"]), _fmt(row["witness_written"]),
+                        _fmt(row["witness"]), _fmt(row["witness_expected"]),
                         "yes" if row["witness_ok"] else "NO",
                         row["seconds"]))
     lines.append("")
@@ -1299,6 +1570,29 @@ def _utc_now() -> str:
 
 
 # ------------------------------------------------------------------------------
+# verdict_exit_code()
+#
+# Non-zero on an ERROR, and equally on a SKIPPED witness comparison.
+#
+# The module says in several messages that a SKIP is not a pass, and the exit
+# code has to agree or the sentence is decoration: a sweep whose witness could
+# not be compared is UNVERIFIED, and CI reading only the exit status would
+# record it as green. W4 and W6 may legitimately skip (monotonicity of one
+# point, enforcement of a proportional lever); W1 and W3 are the comparison
+# itself.
+# ------------------------------------------------------------------------------
+VERIFYING_CHECKS = ("W1", "W3")
+
+
+def verdict_exit_code(findings: Sequence[ec.Finding]) -> int:
+    if ec.has_errors(findings):
+        return 1
+    skipped = [f.check for f in findings
+               if f.check in VERIFYING_CHECKS and f.level == ec.LEVEL_SKIP]
+    return 1 if skipped else 0
+
+
+# ------------------------------------------------------------------------------
 # projection()
 #
 # Wall clock and disk, printed BEFORE a sweep starts. A nine-step sweep is close
@@ -1318,8 +1612,12 @@ def projection(plan: SweepPlan, target_dir: Path) -> Dict[str, float]:
         "minutes": steps * ESTIMATED_RUN_MINUTES,
         "results_mb": need_mb,
         "free_mb": free_mb,
-        "fits": float(not _finite(free_mb)
-                      or free_mb - need_mb >= DISK_MARGIN_MB),
+        # Unmeasurable free space is NOT a pass. It used to be: an unreadable
+        # path gave NaN and the guard reported "fits", which is the module's
+        # own "a SKIP is not a pass" rule broken by its own disk check.
+        "fits": float(_finite(free_mb)
+                      and free_mb - need_mb >= DISK_MARGIN_MB),
+        "measured": float(_finite(free_mb)),
     }
 
 
@@ -1378,6 +1676,17 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _nearest_existing(path: Path) -> Path:
+    """The first ancestor that exists, so disk_usage measures the volume the
+    sweep will write to rather than failing on a root two levels deep that has
+    not been created yet."""
+    path = Path(path).resolve()
+    for candidate in [path] + list(path.parents):
+        if candidate.exists():
+            return candidate
+    return path
+
+
 def _roots(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     sweeps = Path(args.sweeps_root or (SCRIPT_DIR / SWEEPS_DIRNAME))
     derived = Path(args.derived_root or (SCRIPT_DIR / DERIVED_DIRNAME))
@@ -1413,8 +1722,11 @@ def _print_plan(plan: SweepPlan, projected: Dict[str, float]) -> None:
     print("")
     print("projected   : ~%.0f min, ~%.1f GB of results"
           % (projected["minutes"], projected["results_mb"] / 1024.0))
-    if _finite(projected["free_mb"]):
+    if projected["measured"]:
         print("free space  : %.1f GB" % (projected["free_mb"] / 1024.0))
+    else:
+        print("free space  : could not be measured (not a pass -- 'run' will "
+              "refuse without --skip-disk-check)")
     print("")
 
 
@@ -1423,13 +1735,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "check":
         sweep_dir = Path(args.sweep_dir)
-        plan = read_plan(sweep_dir)
-        outcomes = read_outcomes(sweep_dir)
+        try:
+            plan = read_plan(sweep_dir)
+            outcomes = read_outcomes(sweep_dir)
+        except Ercot7kSweepError as exc:
+            # Every other path reports AMW-ERR and exits 2; this one used to
+            # raise a traceback at a mistyped directory.
+            print("AMW-ERR: %s" % exc, file=sys.stderr)
+            return 2
         findings = check_sweep(plan, outcomes)
         text = report_text(plan, outcomes, findings)
-        (sweep_dir / REPORT_NAME).write_text(text, encoding="ascii")
+        (sweep_dir / REPORT_NAME).write_text(
+            text, encoding="ascii", errors="backslashreplace")
         print(text, end="")
-        return 1 if ec.has_errors(findings) else 0
+        return verdict_exit_code(findings)
 
     try:
         plan = plan_sweep(
@@ -1443,8 +1762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     sweeps_root, derived_root, runs_root = _roots(args)
-    projected = projection(plan, runs_root.parent if not runs_root.exists()
-                           else runs_root)
+    projected = projection(plan, _nearest_existing(runs_root))
     _print_plan(plan, projected)
 
     if args.command == "plan":
@@ -1452,12 +1770,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if not projected["fits"] and not args.skip_disk_check:
-        print("AMW-ERR: this sweep projects ~%.1f GB against %.1f GB free, "
-              "leaving less than the %.1f GB margin. Free space, use --prune, "
-              "shorten the sweep, or pass --skip-disk-check."
-              % (projected["results_mb"] / 1024.0,
-                 projected["free_mb"] / 1024.0, DISK_MARGIN_MB / 1024.0),
-              file=sys.stderr)
+        if not projected["measured"]:
+            print("AMW-ERR: free space at %s could not be measured, so the "
+                  "~%.1f GB this sweep projects cannot be checked against it. "
+                  "An unmeasurable disk is not a pass; pass "
+                  "--skip-disk-check to go ahead anyway."
+                  % (runs_root, projected["results_mb"] / 1024.0),
+                  file=sys.stderr)
+        else:
+            print("AMW-ERR: this sweep projects ~%.1f GB against %.1f GB "
+                  "free, leaving less than the %.1f GB margin. Free space, "
+                  "use --prune, shorten the sweep, or pass --skip-disk-check."
+                  % (projected["results_mb"] / 1024.0,
+                     projected["free_mb"] / 1024.0, DISK_MARGIN_MB / 1024.0),
+                  file=sys.stderr)
         return 2
 
     outcomes = run_sweep(
@@ -1471,11 +1797,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = write_summary(sweep_dir, plan, outcomes)
     findings = check_sweep(plan, outcomes)
     text = report_text(plan, outcomes, findings)
-    (sweep_dir / REPORT_NAME).write_text(text, encoding="ascii")
+    (sweep_dir / REPORT_NAME).write_text(
+        text, encoding="ascii", errors="backslashreplace")
     print(text, end="")
     print("summary     : %s" % summary)
     print("report      : %s" % (sweep_dir / REPORT_NAME))
-    return 1 if ec.has_errors(findings) else 0
+    return verdict_exit_code(findings)
 
 
 if __name__ == "__main__":
