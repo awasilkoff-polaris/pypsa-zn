@@ -634,6 +634,214 @@ def test_v15_catches_an_outage_that_states_nothing(mini_base: Path,
     assert "shadowed" in ec.format_findings(findings)
 
 
+# ------------------------------------------------------------------------------
+#   T4 lever 3 -- k_gen partial, in its two modes
+#
+# The two modes exist because SCN_INJ_MAX holds two disjoint populations and the
+# same field means different things to each. Writing the wrong one is not an
+# error in PSO: it is a row that reads as a derate and is discarded.
+# ------------------------------------------------------------------------------
+DERATE_GEN = "N111333_1"   # 275 MW nameplate, MinDispatch 25, no schedule
+AVAIL_GEN = "N220149_1"    # 278 MW nameplate, _fcst and _act schedules
+
+
+def k_gen_derate_row(target: str = DERATE_GEN, value: str = "200") -> dict:
+    return {"lever": "k_gen", "target": target, "mode": "derate",
+            "value": value}
+
+
+def k_gen_avail_row(target: str = AVAIL_GEN, value: str = "0.8") -> dict:
+    return {"lever": "k_gen", "target": target, "mode": "avail",
+            "value": value}
+
+
+def test_k_gen_derate_writes_an_absolute_mw_on_the_default_scenario(
+        mini_base: Path, tmp_path: Path):
+    layer = tmp_path / "kgenderate"
+    ec.build_stress_layer(mini_base, layer, [k_gen_derate_row()])
+
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+    mine = [r for r in rows if r["Injector"] == DERATE_GEN]
+    assert len(mine) == 1
+    assert mine[0]["Scenario"] == "0"
+    assert mine[0]["MaxMw"] == "200.000"
+    assert mine[0]["ScaleFactor"] == "", (
+        "ScaleFactor on a unit with no schedule scales nothing")
+    # The nameplate is untouched: a derate is a scenario override, and INJ_ID
+    # MaxMw is still the BigM the commitment constraints are built from.
+    inj = {r["Injector"]: r for r in
+           ec.read_table(layer / "texas7k_INJ_ID.csv").records()}
+    assert inj[DERATE_GEN]["MaxMw"] == "275.000"
+    assert not ec.has_errors(ec.verify_case(layer))
+
+
+def test_k_gen_avail_scales_both_of_the_schedules_rows(mini_base: Path,
+                                                        tmp_path: Path):
+    """The '*' form, and it is the whole point of the mode: the base gives
+    these units a '0' forecast row and a 'ScnRT' actual row, and a scenario
+    with its own row ignores the default entirely. A factor written to '0'
+    alone would scale SC and DA and leave RT -- the reported cycle -- at 1."""
+    layer = tmp_path / "kgenavail"
+    ec.build_stress_layer(mini_base, layer, [k_gen_avail_row()])
+
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+    mine = [r for r in rows if r["Injector"] == AVAIL_GEN]
+    assert {r["Scenario"] for r in mine} == {"0", "ScnRT"}
+    assert all(r["ScaleFactor"] == "0.800" for r in mine)
+    assert all(r["MaxMw"] == "" for r in mine), (
+        "a static MaxMw here would be outranked by the schedule and ignored")
+    assert [r["Schedule"] for r in mine] == ["%s_fcst" % AVAIL_GEN,
+                                             "%s_act" % AVAIL_GEN]
+    assert not ec.has_errors(ec.verify_case(layer))
+
+
+def test_k_gen_derate_refuses_a_scheduled_injector_and_names_the_other_mode(
+        mini_base: Path):
+    """The trap the whole lever is shaped around: a static MaxMw beside a
+    schedule that covers every interval is ignored for all of them, with no
+    error and no warning."""
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError) as excinfo:
+        ec.stress_deltas([k_gen_derate_row(target=AVAIL_GEN)], tables)
+    message = str(excinfo.value)
+    assert "avail" in message, "the refusal has to name the mode that works"
+    assert "%s_fcst" % AVAIL_GEN in message
+
+
+def test_k_gen_avail_refuses_an_unscheduled_injector_and_names_the_other_mode(
+        mini_base: Path):
+    """The mirror no-op: ScaleFactor is 'a factor used to scale Schedule and
+    Sequence', and this injector carries neither."""
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError) as excinfo:
+        ec.stress_deltas([k_gen_avail_row(target=DERATE_GEN)], tables)
+    assert "derate" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value,why", [
+    ("0", "positive"),          # MaxMw=0 is ignored without Enforce=1
+    ("-5", "positive"),
+    ("900", "INJ_ID.MaxMw"),    # above the nameplate: a plateau, not a derate
+    ("10", "MinDispatch"),      # below the commitment floor
+])
+def test_k_gen_derate_refuses_a_value_outside_the_units_own_window(
+        mini_base: Path, value: str, why: str):
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match=why):
+        ec.stress_deltas([k_gen_derate_row(value=value)], tables)
+
+
+@pytest.mark.parametrize("value,why", [
+    ("0", "positive"),          # a zero ScaleFactor reads as 1
+    ("1.2", "above 1"),         # this lever restricts; it does not raise
+])
+def test_k_gen_avail_refuses_a_factor_that_is_not_a_derate(mini_base: Path,
+                                                            value: str,
+                                                            why: str):
+    tables = ec.read_case(mini_base)
+    with pytest.raises(ec.Ercot7kCaseError, match=why):
+        ec.stress_deltas([k_gen_avail_row(value=value)], tables)
+
+
+def test_neither_partial_mode_will_touch_a_load(mini_base: Path,
+                                                 tmp_path: Path):
+    """INJ_ID.md: for a LoadFlag injector MaxMw limits WITHDRAWAL, so capping
+    it cuts demand while every report reads it as a generation derate."""
+    dc = tmp_path / "dc"
+    ec.build_datacenter_layer(mini_base, dc, mini_spec())
+    tables = ec.read_case(dc)
+    with pytest.raises(ec.Ercot7kCaseError, match="LoadFlag=1"):
+        ec.stress_deltas([k_gen_derate_row(target="DC1_LOAD", value="50")],
+                         tables)
+    with pytest.raises(ec.Ercot7kCaseError, match="LoadFlag=1"):
+        ec.stress_deltas([k_gen_avail_row(target="DC1_LOAD")], tables)
+    # BYOG is a generator with no schedule, so a derate of it IS meaningful.
+    assert ec.stress_deltas([k_gen_derate_row(target="DC1_BYOG", value="30")],
+                            tables)
+
+
+def test_the_two_partial_modes_are_registered_and_dispatch_separately():
+    """A mode in the registry with no branch in stress_deltas() would be
+    accepted by the front end and then refused by an internal error."""
+    assert set(ec.STRESS_LEVERS["k_gen"]["modes"]) == {"outage", "derate",
+                                                       "avail"}
+    tables = ec.read_case(MINI_DIR)
+    outage = ec.stress_deltas([k_gen_row()], tables)[0]
+    derate = ec.stress_deltas([k_gen_derate_row()], tables)[0]
+    avail = ec.stress_deltas([k_gen_avail_row()], tables)[0]
+    assert outage.table == "SCN_INJ_OUT"
+    assert derate.table == "SCN_INJ_MAX" and derate.scenario == "0"
+    assert avail.table == "SCN_INJ_MAX" and avail.scenario == "*"
+
+
+# ------------------------------------------------------------------------------
+#   V16 -- the SCN_INJ_MAX rows that are present and mean nothing
+# ------------------------------------------------------------------------------
+def _v16_message(case_dir: Path) -> str:
+    return ec.format_findings(ec.verify_case(case_dir))
+
+
+def test_v16_is_quiet_on_the_untouched_case():
+    """The shipped base is nothing but scheduled injectors with blank MaxMw
+    and blank ScaleFactor. A check that fires there would be noise on every
+    run and would be learned to ignore."""
+    findings = [f for f in ec.verify_case(MINI_DIR) if f.check == "V16"]
+    assert findings and not any(f.level == ec.LEVEL_ERROR for f in findings)
+
+
+@pytest.mark.parametrize("row,expected", [
+    # A static MaxMw beside a schedule that outranks it.
+    ("0,N220151_1,100.000,,,N220151_1_fcst,", "outranks"),
+    # A ScaleFactor with nothing to scale.
+    ("0,N111180_1,,,0.800,,", "neither Schedule nor Sequence"),
+    # MaxMw=0 without Enforce: ignored, not "off".
+    ("0,N111180_1,0.000,,,,", "Enforce=1"),
+    # A zero ScaleFactor reads as 1.
+    ("0,N220151_1,,,0.000,N220151_1_fcst,", "read as 1"),
+])
+def test_v16_catches_a_restriction_that_states_nothing(mini_base: Path,
+                                                        tmp_path: Path,
+                                                        row: str,
+                                                        expected: str):
+    layer = tmp_path / "kgenderate"
+    ec.build_stress_layer(mini_base, layer, [k_gen_derate_row()])
+    assert not ec.has_errors(ec.verify_case(layer))
+
+    target = layer / "texas7k_SCN_INJ_MAX.csv"
+    target.write_bytes(target.read_bytes() + (row + "\n").encode("ascii"))
+    # Filtered to V16, not merely searched for in the whole report: appending a
+    # line to a layer file also breaks the V9 hash chain, so a test that asked
+    # only "did anything error" would pass with V16 doing nothing at all.
+    findings = [f for f in ec.verify_case(layer) if f.check == "V16"]
+    assert any(f.level == ec.LEVEL_ERROR for f in findings)
+    assert expected in ec.format_findings(findings)
+
+
+def test_v16_catches_a_default_value_that_does_not_reach_the_reported_cycle(
+        mini_base: Path, tmp_path: Path):
+    """The k_load trap in this table's terms. A scenario carrying its own row
+    ignores the '0' row entirely, so a value written only to '0' applies to
+    every cycle EXCEPT that one -- and here that one is ScnRT, which is what
+    every report is read from."""
+    layer = tmp_path / "kgenavail"
+    ec.build_stress_layer(mini_base, layer, [k_gen_avail_row()])
+    assert not ec.has_errors(ec.verify_case(layer))
+
+    target = layer / "texas7k_SCN_INJ_MAX.csv"
+    rows = target.read_text(encoding="ascii").splitlines()
+    # Strip the factor from the ScnRT row only, which is exactly what a
+    # scenario-by-scenario writer would have produced.
+    rewritten = [line.replace("0.800", "") if line.startswith("ScnRT,%s,"
+                                                              % AVAIL_GEN)
+                 else line for line in rows]
+    target.write_text("\n".join(rewritten) + "\n", encoding="ascii",
+                      newline="")
+    findings = [f for f in ec.verify_case(layer) if f.check == "V16"]
+    assert any(f.level == ec.LEVEL_ERROR for f in findings)
+    message = ec.format_findings(findings)
+    assert "shadowed" in message and "ScnRT" in message
+
+
 def test_a_stress_layer_keeps_its_parents_datacenter_in_the_manifest(
         mini_base: Path, tmp_path: Path):
     """

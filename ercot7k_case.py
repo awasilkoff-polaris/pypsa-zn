@@ -222,15 +222,25 @@ STRESS_LEVERS: Dict[str, Dict[str, Any]] = {
         ),
     },
     "k_gen": {
-        "modes": ("outage",),
+        "modes": ("outage", "derate", "avail"),
         "table": "SCN_INJ_OUT",
         "target": "injector",
         "note": (
-            "full outage of one named generator, one per row. Takes value 1 "
-            "and nothing else: Outage is a bit, and a 0 does not mean "
-            "'available', it is ignored unless Enforce=1. Partial derate is a "
-            "different mode against SCN_INJ_MAX and is not built yet."
+            "one named generator. THREE modes, and they are not "
+            "interchangeable. 'outage' is the full removal via SCN_INJ_OUT and "
+            "takes value 1 and nothing else: Outage is a bit, and a 0 does not "
+            "mean 'available', it is ignored unless Enforce=1. 'derate' caps "
+            "dispatch at an absolute MW via SCN_INJ_MAX.MaxMw, and is for the "
+            "injectors that carry no availability schedule. 'avail' scales an "
+            "existing availability schedule via SCN_INJ_MAX.ScaleFactor, and "
+            "is for the ones that do. Each refuses the other's population "
+            "rather than writing a row that reads as a derate and is ignored."
         ),
+        "mode_tables": {
+            "outage": "SCN_INJ_OUT",
+            "derate": "SCN_INJ_MAX",
+            "avail": "SCN_INJ_MAX",
+        },
     },
     "k_line": {
         "modes": ("scale",),
@@ -1093,8 +1103,18 @@ def stress_deltas(rows: Sequence[Dict[str, str]],
             deltas.append(_k_line_delta(target, magnitude, tables))
             continue
         if lever == "k_gen":
-            deltas.append(_k_gen_outage_delta(target, magnitude, tables))
-            continue
+            if mode == "outage":
+                deltas.append(_k_gen_outage_delta(target, magnitude, tables))
+                continue
+            if mode == "derate":
+                deltas.append(_k_gen_derate_delta(target, magnitude, tables))
+                continue
+            if mode == "avail":
+                deltas.append(_k_gen_avail_delta(target, magnitude, tables))
+                continue
+            raise Ercot7kCaseError(
+                "mode %s is in STRESS_LEVERS[%s]['modes'] but stress_deltas() "
+                "has no branch for it" % (mode, lever))
         raise Ercot7kCaseError(
             "lever %s is in STRESS_LEVERS but stress_deltas() has no branch "
             "for it" % lever)
@@ -1280,6 +1300,175 @@ def _k_gen_outage_delta(injector: str, value: float,
 
     return ScenarioOverride.of(
         "SCN_INJ_OUT", "0", injector, {"Outage": "1"})
+
+
+# ------------------------------------------------------------------------------
+# _k_gen_derate_delta() and _k_gen_avail_delta()
+#
+# The k_gen lever in its two PARTIAL modes, both against SCN_INJ_MAX. They are
+# separate modes rather than one clever one because the table holds two disjoint
+# populations and the SAME FIELD means different things to each -- and writing
+# the wrong field for a population is not an error in PSO, it is a row that
+# reads as a derate and is discarded:
+#
+#   an injector that already carries availability rows (in the shipped case,
+#   167 renewables with a '0' -> <unit>_fcst row and a 'ScnRT' -> <unit>_act
+#   row) takes ScaleFactor ONLY -- mode 'avail'. The documented priority is
+#   Sequence, then Schedule, then the static value, and those schedules cover
+#   every interval, so a static MaxMw is ignored for all of them: no error, no
+#   warning, a capacity lever that did nothing.
+#
+#   an injector with no rows takes an absolute MaxMw on scenario '0' -- mode
+#   'derate'. ScaleFactor there is the mirror no-op: SCN_INJ_MAX.md defines it
+#   as "a factor used to scale Schedule and Sequence", and the injector carries
+#   neither, so it scales nothing. This is the same trap as
+#   SCN_BRN_LMT.ScaleFactor in _k_line_delta(), one table over.
+#
+# Each mode therefore REFUSES the other's population by name rather than
+# accepting it and hoping. _apply_injector_max_override() enforces the same rule
+# at write time; this refuses it one step earlier, where the operator can still
+# read the value they typed in the message.
+#
+# Mode 'derate' takes MW and not a factor deliberately. MaxMw is an absolute
+# field, so a factor would have to be multiplied by something here, and the
+# witness in ercot7k_sweep.py then compares the results against arithmetic done
+# in this module rather than against the number the case file states.
+# ------------------------------------------------------------------------------
+def _scheduled_max_rows(injector: str,
+                        tables: Dict[str, Table]) -> List[Dict[str, str]]:
+    table = tables.get("SCN_INJ_MAX")
+    if table is None:
+        return []
+    return [r for r in table.records() if r["Injector"] == injector]
+
+
+def _k_gen_target_row(injector: str, mode: str,
+                      tables: Dict[str, Table]) -> Dict[str, str]:
+    """INJ_ID's row for the target, with the two refusals both modes share."""
+    table = tables.get("INJ_ID")
+    if table is None:
+        raise Ercot7kCaseError(
+            "k_gen needs an INJ_ID table and the case has none")
+    rows = {r["Injector"]: r for r in table.records()}
+    row = rows.get(injector)
+    if row is None:
+        raise Ercot7kCaseError(
+            "k_gen names injector %r, which is not in INJ_ID (%d injectors). "
+            "The target is an Injector key, not a node or a substation name."
+            % (injector, len(rows)))
+    if row.get("LoadFlag") == "1":
+        raise Ercot7kCaseError(
+            "k_gen %s names %r, which carries LoadFlag=1 and is therefore a "
+            "LOAD, not a generator. INJ_ID.md: for a LoadFlag injector MaxMw "
+            "is a limit on WITHDRAWAL, so capping it cuts demand while every "
+            "report reads it as a generation derate. Scale load with k_load."
+            % (mode, injector))
+    return row
+
+
+def _k_gen_derate_delta(injector: str, mw: float,
+                        tables: Dict[str, Table]) -> Delta:
+    row = _k_gen_target_row(injector, "derate", tables)
+
+    existing = _scheduled_max_rows(injector, tables)
+    if existing:
+        raise Ercot7kCaseError(
+            "k_gen derate names %r, which already carries %d SCN_INJ_MAX "
+            "row(s) (%s). VERIFIED, SCN_INJ_MAX.md and the general scenario "
+            "notes: the priority is Sequence, then Schedule, then the static "
+            "value, so a static MaxMw on an injector whose schedule covers "
+            "every interval is ignored for all of them -- silently. Use mode "
+            "'avail', which scales that schedule, or lower INJ_ID.MaxMw if the "
+            "nameplate itself is meant to change."
+            % (injector, len(existing),
+               ", ".join("%s -> %s" % (r["Scenario"], r["Schedule"] or "(none)")
+                         for r in existing[:4])))
+
+    if mw <= 0.0:
+        raise Ercot7kCaseError(
+            "k_gen derate value %s must be positive. VERIFIED, "
+            "SCN_INJ_MAX.md: Enforce 'identifies that MaxMw = 0 should be "
+            "enforced', so a zero without Enforce is ignored rather than "
+            "meaning 'off' -- the same asymmetry as SCN_INJ_OUT.Outage. A full "
+            "removal is mode 'outage', which states it as one." % mw)
+
+    ceiling = _as_float(row.get("MaxMw", ""))
+    if ceiling != ceiling or ceiling <= 0.0:
+        raise Ercot7kCaseError(
+            "k_gen derate names %r, whose INJ_ID.MaxMw is %r. There is no "
+            "capacity to restrict." % (injector, row.get("MaxMw", "")))
+    if mw > ceiling:
+        raise Ercot7kCaseError(
+            "k_gen derate asks for %s MW on %s, above its INJ_ID.MaxMw %s. "
+            "SCN_INJ_MAX 'identifies more restrictive MaxMw' -- it can only "
+            "restrict, never raise -- so this step and every step above the "
+            "nameplate would report the SAME number and read as a plateau in "
+            "the response curve rather than as a refused input."
+            % (FMT_MW % mw, injector, row.get("MaxMw", "")))
+
+    commitment = tables.get("INJ_CMT")
+    if commitment is not None:
+        for record in commitment.records():
+            if record["Injector"] != injector:
+                continue
+            floor = _as_float(record.get("MinDispatch", ""))
+            if floor == floor and mw < floor:
+                raise Ercot7kCaseError(
+                    "k_gen derate asks for %s MW on %s, below its "
+                    "INJ_CMT.MinDispatch %s. VERIFIED, SCN_INJ_MAX.md: 'Limit "
+                    "cannot be more restrictive than MinDispatch (INJ_CMT).' "
+                    "Sweeping past the floor asks the model for a dispatch "
+                    "window that does not exist; take the unit out with mode "
+                    "'outage' instead."
+                    % (FMT_MW % mw, injector, record.get("MinDispatch", "")))
+            break
+
+    return ScenarioOverride.of(
+        "SCN_INJ_MAX", "0", injector, {"MaxMw": FMT_MW % mw})
+
+
+def _k_gen_avail_delta(injector: str, factor: float,
+                       tables: Dict[str, Table]) -> Delta:
+    _k_gen_target_row(injector, "avail", tables)
+
+    existing = _scheduled_max_rows(injector, tables)
+    if not existing:
+        raise Ercot7kCaseError(
+            "k_gen avail names %r, which carries no SCN_INJ_MAX row, so there "
+            "is no Schedule or Sequence for a ScaleFactor to scale -- "
+            "SCN_INJ_MAX.md defines it as 'a factor used to scale Schedule and "
+            "Sequence' and nothing else. This is the SCN_BRN_LMT.ScaleFactor "
+            "no-op one table over. Use mode 'derate', which writes an absolute "
+            "MaxMw." % injector)
+    scheduled = [r for r in existing
+                 if (r.get("Schedule") or "").strip()
+                 or (r.get("Sequence") or "").strip()]
+    if not scheduled:
+        raise Ercot7kCaseError(
+            "k_gen avail names %r, whose %d SCN_INJ_MAX row(s) carry neither "
+            "Schedule nor Sequence, so a ScaleFactor on them scales nothing. "
+            "Use mode 'derate'." % (injector, len(existing)))
+
+    if factor <= 0.0:
+        raise Ercot7kCaseError(
+            "k_gen avail value %s must be positive. A ScaleFactor of 0 is read "
+            "as 1, so a zero does not zero the unit, it leaves it untouched -- "
+            "the same trap as k_load. A full removal is mode 'outage'."
+            % factor)
+    if factor > 1.0:
+        raise Ercot7kCaseError(
+            "k_gen avail value %s is above 1. SCN_INJ_MAX 'identifies more "
+            "restrictive MaxMw', so this lever is a derate; scaling an "
+            "availability forecast ABOVE itself asks the case for capacity the "
+            "schedule never claimed. Raise the schedule if that is the "
+            "intent." % factor)
+
+    # The '*' all-rows form, and it is not a convenience: these injectors carry
+    # a '0' row and a 'ScnRT' row, and a scenario with its own row ignores the
+    # default entirely. A factor written to '0' alone would scale SC and DA and
+    # leave RT -- the reported cycle -- at 1.
+    return ScenarioOverride.of(
+        "SCN_INJ_MAX", "*", injector, {"ScaleFactor": FMT_MW % factor})
 
 
 # ------------------------------------------------------------------------------
@@ -2297,7 +2486,8 @@ def verify_case(case_dir: Path, strict_monitored: bool = False,
                   _v4_schedule_span, _v5_scenario_rows, _v6_area_load_scale,
                   _v7_injector_domain, _v8_monitored_branch, _v9_parent_diff,
                   _v10_file_set, _v11_capacity_ceiling, _v12_cost_curve_overlap,
-                  _v13_cost_range, _v14_branch_limit, _v15_injector_outage):
+                  _v13_cost_range, _v14_branch_limit, _v15_injector_outage,
+                  _v16_injector_max):
         findings.extend(check(ctx))
     return findings
 
@@ -2751,6 +2941,157 @@ def _v15_injector_outage(ctx: _VerifyContext) -> List[Finding]:
                     "%d generator outage(s) on the default scenario, "
                     "unshadowed, removing %.1f MW of capacity"
                     % (len(rows), removed))]
+
+
+# ------------------------------------------------------------------------------
+# V16 -- SCN_INJ_MAX actually restricts a generator, in the form that population
+#        can read
+#
+# V11 asks whether a MaxMw is below the ceiling. V16 asks the prior question:
+# whether the row says anything at all. Every shape below runs to optimality and
+# reports a derate that never happened.
+#
+#   - MaxMw on a row that also carries a Schedule or Sequence. The documented
+#     priority is Sequence, then Schedule, then the static value, so the static
+#     number is ignored for every interval the schedule covers -- which, for
+#     this case's 167 renewables, is all of them.
+#   - ScaleFactor on a row carrying neither. SCN_INJ_MAX.md: it is "a factor
+#     used to scale Schedule and Sequence". With neither present it scales
+#     nothing, exactly as SCN_BRN_LMT.ScaleFactor does to a branch limit.
+#   - MaxMw = 0 without Enforce=1. Enforce "identifies that MaxMw = 0 should be
+#     enforced", so the zero is ignored rather than closing the unit.
+#   - ScaleFactor = 0, which reads as 1.
+#   - a value on the default scenario '0' that a scenario-specific row does not
+#     also carry. A scenario with its own row ignores the default, so the
+#     restriction applies to every cycle EXCEPT that one -- and in this case the
+#     scenario with its own row is ScnRT, the reported cycle. This is the
+#     k_load trap (a factor written to one scenario) in this table's terms, and
+#     it is why mode 'avail' writes the '*' all-rows form.
+#
+# The last rule is stated as "the default's FIELDS must reach the overriding
+# row", not as "there must be no scenario-specific row": the shipped base is
+# nothing but injectors with a '0' forecast row and a 'ScnRT' actual row, and
+# that arrangement is the case working as designed.
+# ------------------------------------------------------------------------------
+def _v16_injector_max(ctx: _VerifyContext) -> List[Finding]:
+    rows = ctx.rec("SCN_INJ_MAX")
+    if not rows:
+        return [Finding("V16", LEVEL_SKIP, "no SCN_INJ_MAX table")]
+
+    injectors = {r["Injector"]: r for r in ctx.rec("INJ_ID")}
+    out: List[Finding] = []
+
+    def value_of(record: Dict[str, str], field: str) -> str:
+        return (record.get(field) or "").strip()
+
+    def has_schedule(record: Dict[str, str]) -> bool:
+        return bool(value_of(record, "Schedule")
+                    or value_of(record, "Sequence"))
+
+    missing = sorted({r["Injector"] for r in rows
+                      if r["Injector"] not in injectors})
+    if missing:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "SCN_INJ_MAX names %d injector(s) absent from "
+                           "INJ_ID: %s"
+                           % (len(missing), ", ".join(missing[:10]))))
+
+    ignored_static = sorted({
+        "%s on %s" % (r["Injector"], r["Scenario"]) for r in rows
+        if value_of(r, "MaxMw") and has_schedule(r)})
+    if ignored_static:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "%d SCN_INJ_MAX row(s) set a static MaxMw beside a "
+                           "Schedule or Sequence, which outranks it, so the MW "
+                           "is ignored for every interval the schedule covers: "
+                           "%s"
+                           % (len(ignored_static),
+                              "; ".join(ignored_static[:10]))))
+
+    inert_factor = sorted({
+        "%s on %s" % (r["Injector"], r["Scenario"]) for r in rows
+        if value_of(r, "ScaleFactor") and not has_schedule(r)})
+    if inert_factor:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "%d SCN_INJ_MAX row(s) set a ScaleFactor with "
+                           "neither Schedule nor Sequence to scale, so the "
+                           "factor states nothing: %s"
+                           % (len(inert_factor), "; ".join(inert_factor[:10]))))
+
+    zero_max = sorted({
+        "%s on %s" % (r["Injector"], r["Scenario"]) for r in rows
+        if value_of(r, "MaxMw") and _as_float(r["MaxMw"]) == 0.0
+        and value_of(r, "Enforce") != "1"})
+    if zero_max:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "%d SCN_INJ_MAX row(s) set MaxMw=0 without "
+                           "Enforce=1; Enforce is what identifies that a zero "
+                           "should be enforced, so the row is ignored rather "
+                           "than closing the unit: %s"
+                           % (len(zero_max), "; ".join(zero_max[:10]))))
+
+    zero_factor = sorted({
+        "%s on %s" % (r["Injector"], r["Scenario"]) for r in rows
+        if value_of(r, "ScaleFactor") and _as_float(r["ScaleFactor"]) == 0.0})
+    if zero_factor:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "%d SCN_INJ_MAX row(s) set ScaleFactor=0, which is "
+                           "read as 1 rather than as a zeroed unit: %s"
+                           % (len(zero_factor), "; ".join(zero_factor[:10]))))
+
+    # The shadowing rule, field by field.
+    by_injector: Dict[str, List[Dict[str, str]]] = {}
+    for record in rows:
+        by_injector.setdefault(record["Injector"], []).append(record)
+    unreached: List[str] = []
+    for injector, group in sorted(by_injector.items()):
+        default = [r for r in group if r["Scenario"] == "0"]
+        named = [r for r in group if r["Scenario"] != "0"]
+        if not default or not named:
+            continue
+        for field in ("MaxMw", "ScaleFactor"):
+            if not any(value_of(r, field) for r in default):
+                continue
+            for record in named:
+                if not value_of(record, field):
+                    unreached.append("%s %s on '0' does not reach %s"
+                                     % (injector, field, record["Scenario"]))
+    if unreached:
+        out.append(Finding("V16", LEVEL_ERROR,
+                           "%d default-scenario restriction(s) are shadowed: a "
+                           "scenario with its own SCN_INJ_MAX row ignores the "
+                           "'0' row entirely, so the lever misses that cycle "
+                           "-- here that is %s. Write the value to every row of "
+                           "the injector (the '*' form): %s"
+                           % (len(unreached),
+                              ", ".join(sorted({u.rsplit(" ", 1)[-1]
+                                                for u in unreached})),
+                              "; ".join(unreached[:10]))))
+
+    if out:
+        return out
+
+    restricting = [r for r in rows
+                   if value_of(r, "MaxMw") or value_of(r, "ScaleFactor")]
+    if not restricting:
+        return [Finding("V16", LEVEL_SKIP,
+                        "%d SCN_INJ_MAX row(s), none of which carries a MaxMw "
+                        "or a ScaleFactor, so nothing is restricted here"
+                        % len(rows))]
+    stated = []
+    for record in restricting[:5]:
+        if value_of(record, "MaxMw"):
+            plate = injectors.get(record["Injector"], {}).get("MaxMw", "")
+            stated.append("%s MaxMw %s of %s"
+                          % (record["Injector"], record["MaxMw"], plate))
+        else:
+            stated.append("%s ScaleFactor %s on %s"
+                          % (record["Injector"], record["ScaleFactor"],
+                             record["Scenario"]))
+    return [Finding("V16", LEVEL_OK,
+                    "%d of %d SCN_INJ_MAX row(s) restrict a generator in a "
+                    "form its population can read: %s"
+                    % (len(restricting), len(rows), "; ".join(stated)))]
 
 
 # ------------------------------------------------------------------------------

@@ -433,6 +433,69 @@ def path_limit_by_interval(results_dir: Path, cycle: str, scenario: str,
 
 
 # ------------------------------------------------------------------------------
+# injector_limit_by_interval()
+#
+# The k_gen derate witness: ED_Inj.Max for ONE injector, per interval.
+#
+# ED_Inj.md defines Max as the dispatch limit and says it is "de-rated by
+# fixed-dispatch (SCN_INJ_DSP) or dispatch limits (SCN_INJ_MAX)" -- so on a
+# capped unit it is the cap read back out of the solution, an input echo in the
+# input's own units. That is what makes it usable the way PN_Pth.Max is for
+# k_line, and unlike PN_Pth there is no reporting-scope question: ED_Inj carries
+# every injector in every interval of every cycle.
+#
+# Two things ride along, and neither is decoration:
+#
+#   Cap ("installed seasonal capacity") is NOT derated by SCN_INJ_MAX. It is the
+#   only way to tell a capped unit from an unavailable one, because the same
+#   sentence in ED_Inj.md says Max is "set to zero when off due to scheduled
+#   outage, forced outage, failed startup, or unavailable for commitment". A
+#   unit the solve left uncommitted therefore reports Max=0 at that interval
+#   whatever cap the case asked for -- 33,675 of the validated run's 106,848 RT
+#   rows are exactly that -- and reading it as the witness would say the lever
+#   derated the unit to nothing.
+#
+#   LimitViolation is the enforcement half. PSO's injector dispatch limits are
+#   soft slacks rather than hard constraints, so "the cap was reported" and "the
+#   cap was respected" are separable here in the same way MaxEnforced separates
+#   them for a branch: dispatch above the cap appears as a positive
+#   LimitViolation rather than as an infeasibility.
+#
+# An injector absent from the results is ABSENT from the mapping, never 0.0.
+# ------------------------------------------------------------------------------
+def injector_limit_by_interval(results_dir: Path, cycle: str, scenario: str,
+                               injector: str) -> Dict[int, Dict[str, float]]:
+    path = require_result(results_dir, "ED_Inj")
+    columns_present = result_columns(path)
+    out: Dict[int, Dict[str, float]] = {}
+    with result_reader(path) as (columns, rows):
+        i_cyc, i_scn, i_inj, i_int, i_max, i_p = column_indexes(
+            columns, ("cyc", "scn", "inj", "int", "Max", "P"), path
+        )
+        # Cap and LimitViolation are read where present and reported as NaN
+        # where not. "This results set cannot answer" and "the cap was
+        # respected" are different findings, and the second must not be
+        # manufactured from the first.
+        i_cap = (column_index(columns, "Cap", path)
+                 if "Cap" in columns_present else -1)
+        i_limvio = (column_index(columns, "LimitViolation", path)
+                    if "LimitViolation" in columns_present else -1)
+        for row in rows:
+            if row[i_cyc] != cycle or row[i_scn] != scenario:
+                continue
+            if row[i_inj] != injector:
+                continue
+            out[int(row[i_int])] = {
+                "max_mw": _num(row[i_max]),
+                "cap_mw": _num(row[i_cap]) if i_cap >= 0 else math.nan,
+                "p_mw": _num(row[i_p]),
+                "limit_violation_mw": (_num(row[i_limvio]) if i_limvio >= 0
+                                       else math.nan),
+            }
+    return out
+
+
+# ------------------------------------------------------------------------------
 # pin_interval()
 #
 # The reported interval must be pinned by the study, not recomputed per run.

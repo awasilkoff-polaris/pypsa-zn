@@ -92,6 +92,13 @@ def pin() -> er.ReportKey:
 # one and not a plausible name.
 BASE_LOAD_MW = 200.0
 
+# mini7k's two SCN_INJ_MAX populations, which is what k_gen's two partial modes
+# split on: DERATE_GEN carries no row (275 MW nameplate, MinDispatch 25) and
+# takes an absolute MaxMw; AVAIL_GEN carries a '0' forecast row and a 'ScnRT'
+# actual row and takes a ScaleFactor.
+DERATE_GEN = "N111333_1"
+AVAIL_GEN = "N220149_1"
+
 
 # ------------------------------------------------------------------------------
 #   1. sweep_steps -- inherited defect 2, the dropped endpoint
@@ -254,27 +261,52 @@ def test_run_directories_also_sort_numerically_past_ninety_nine():
 # ------------------------------------------------------------------------------
 #   2. Which levers can be swept
 # ------------------------------------------------------------------------------
-def test_k_gen_is_refused_with_the_reason_rather_than_ignored():
-    """Outage is a BIT: the lever takes 1 and nothing else, so its value axis
+def test_k_gen_outage_is_refused_with_the_reason_rather_than_ignored():
+    """Outage is a BIT: the mode takes 1 and nothing else, so its value axis
     has one admissible point. Refusing it names what would be sweepable."""
     with pytest.raises(es.Ercot7kSweepError) as excinfo:
-        es.witness_for("k_gen")
+        es.witness_for("k_gen", "outage")
     message = str(excinfo.value)
     assert "cannot be swept" in message
-    assert "k_line" in message and "k_load" in message
+    assert "k_line/scale" in message and "k_gen/derate" in message
+
+
+def test_the_witness_is_chosen_by_mode_and_not_by_lever_alone():
+    """k_gen writes SCN_INJ_OUT in one mode and SCN_INJ_MAX in the others. A
+    witness keyed by lever would read an injector limit for a sweep that wrote
+    an outage bit, and agree with itself about a case it never described."""
+    assert es.witness_for("k_gen", "derate").column == "ED_Inj.Max"
+    assert es.witness_for("k_gen", "avail").column == "ED_Inj.Max"
+    assert es.witness_for("k_line", "scale").column == "PN_Pth.Max"
+    assert ("k_gen", "outage") not in es.WITNESSES
+
+
+def test_the_two_partial_modes_differ_in_kind_and_say_why():
+    """'derate' writes an absolute MW the results echo in MW, so it can be
+    compared against the case file. 'avail' writes a factor on a schedule, so
+    the level is only known up to that factor and the check is relative."""
+    assert es.witness_for("k_gen", "derate").kind == "absolute"
+    assert es.witness_for("k_gen", "avail").kind == "proportional"
 
 
 def test_an_unimplemented_lever_is_refused_naming_both_lists():
     with pytest.raises(es.Ercot7kSweepError) as excinfo:
-        es.witness_for("mc_bus")
+        es.witness_for("mc_bus", "scale")
     assert "not implemented at all" in str(excinfo.value)
 
 
-def test_every_sweepable_lever_is_also_a_real_lever():
-    """A witness for a lever ercot7k_case.py does not implement would be a
-    sweep that cannot build its first layer."""
-    for lever in es.SWEEPABLE:
+def test_an_unimplemented_mode_is_refused_before_the_witness_is_chosen():
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.witness_for("k_line", "derate")
+    assert "does not implement mode" in str(excinfo.value)
+
+
+def test_every_sweepable_pair_is_also_a_real_lever_and_mode():
+    """A witness for a lever or mode ercot7k_case.py does not implement would
+    be a sweep that cannot build its first layer."""
+    for lever, mode in es.SWEEPABLE:
         assert lever in ec.STRESS_LEVERS
+        assert mode in ec.STRESS_LEVERS[lever]["modes"]
 
 
 # ------------------------------------------------------------------------------
@@ -295,7 +327,7 @@ def test_the_step_value_survives_into_the_built_case_file(mini_base, tmp_path):
     ec.build_stress_layer(mini_base, layer,
                           es.build_step_rows("k_line", branch, "scale", 0.9),
                           slug="k_line0p9")
-    written = es.written_witness("k_line", branch, layer)
+    written = es.written_witness("k_line", "scale", branch, layer)
     base_limit = _branch_limit(mini_base, branch)
     assert written == pytest.approx(base_limit * 0.9)
 
@@ -349,13 +381,20 @@ def write_fake_results(results_dir: Path, load_mw: float,
                        report_path: bool = True,
                        max_enforced: int = 1,
                        min_enforced: int = 0,
-                       with_enforced_column: bool = True) -> None:
+                       with_enforced_column: bool = True,
+                       gen_name: str = "GEN_A",
+                       gen_max_mw: float = 500.0,
+                       gen_cap_mw: float = 500.0,
+                       gen_p_mw: float = 180.0,
+                       gen_limit_violation_mw: float = 0.0,
+                       report_gen: bool = True) -> None:
     """
     A two-interval run in the shape ercot7k_results.py reads.
 
-    Modelled on the synthetic directory in test_ercot7k_results.py. The two
+    Modelled on the synthetic directory in test_ercot7k_results.py. The three
     numbers this driver reads back are parameters: area load (the k_load
-    witness) and the path limit (the k_line witness).
+    witness), the path limit (the k_line witness) and the injector dispatch
+    limit (the k_gen one).
     """
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -405,10 +444,24 @@ def write_fake_results(results_dir: Path, load_mw: float,
             % enf,
         ]
     write("PN_Pth", pth_header, pth_rows)
+    # Cap sits beside Max as it does in the real header. It is what separates a
+    # unit capped by the lever from one the solve left uncommitted, which
+    # reports Max=0 under a full Cap.
+    inj_rows = ["RT,ScnRT,GEN_OTHER,1,100.000,500.000,500.000,0.000,0.000,"
+                "0.000,0.000",
+                "RT,ScnRT,GEN_OTHER,2,180.000,500.000,500.000,0.000,0.000,"
+                "0.000,0.000"]
+    if report_gen:
+        inj_rows += [
+            "RT,ScnRT,%s,1,%.3f,%.3f,%.3f,0.000,0.000,0.000,0.000"
+            % (gen_name, min(gen_p_mw, gen_max_mw), gen_max_mw, gen_cap_mw),
+            "RT,ScnRT,%s,2,%.3f,%.3f,%.3f,0.000,%.3f,0.000,0.000"
+            % (gen_name, gen_p_mw, gen_max_mw, gen_cap_mw,
+               gen_limit_violation_mw),
+        ]
     write("ED_Inj",
-          "cyc,scn,inj,int,P,Max,Min,LimitViolation,RampViolation,Penalty",
-          ["RT,ScnRT,GEN_A,1,100.000,500.000,0.000,0.000,0.000,0.000",
-           "RT,ScnRT,GEN_A,2,180.000,500.000,0.000,0.000,0.000,0.000"])
+          "cyc,scn,inj,int,P,Max,Cap,Min,LimitViolation,RampViolation,Penalty",
+          inj_rows)
 
 
 # ------------------------------------------------------------------------------
@@ -417,7 +470,7 @@ def write_fake_results(results_dir: Path, load_mw: float,
 def test_the_k_load_witness_is_the_area_load_at_the_pinned_interval(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=220.0)
-    witness, enforced = es.read_witness("k_load", "", results, pin())
+    witness, enforced = es.read_witness("k_load", "scale", "", results, pin())
     assert witness == pytest.approx(220.0)
     assert math.isnan(enforced), "enforcement is not a question for area load"
 
@@ -425,7 +478,8 @@ def test_the_k_load_witness_is_the_area_load_at_the_pinned_interval(tmp_path):
 def test_the_k_line_witness_is_the_path_limit_at_the_pinned_interval(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0)
-    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "scale", "BR1", results,
+                                        pin())
     assert witness == pytest.approx(90.0)
     assert enforced == 1.0
 
@@ -436,7 +490,8 @@ def test_an_unreported_path_is_not_measured_and_never_a_limit_of_zero(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1",
                        report_path=False)
-    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "scale", "BR1", results,
+                                        pin())
     assert math.isnan(witness)
     assert math.isnan(enforced)
 
@@ -452,7 +507,8 @@ def test_a_limit_enforced_on_its_MIN_side_counts_as_enforced(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
                        min_enforced=1, max_enforced=0)
-    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "scale", "BR1", results,
+                                        pin())
     assert witness == pytest.approx(90.0)
     assert enforced == 1.0
 
@@ -465,7 +521,8 @@ def test_a_limit_reported_but_not_enforced_is_read_as_not_enforced(tmp_path):
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
                        min_enforced=0, max_enforced=0)
-    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "scale", "BR1", results,
+                                        pin())
     assert witness == pytest.approx(90.0), "the limit is still reported"
     assert enforced == 0.0, "but it was not in the LP on either side"
 
@@ -478,18 +535,174 @@ def test_results_without_a_maxenforced_column_report_unknown_not_false(
     results = tmp_path / "results"
     write_fake_results(results, load_mw=200.0, path_name="BR1", limit_mw=90.0,
                        with_enforced_column=False)
-    witness, enforced = es.read_witness("k_line", "BR1", results, pin())
+    witness, enforced = es.read_witness("k_line", "scale", "BR1", results,
+                                        pin())
     assert witness == pytest.approx(90.0)
     assert math.isnan(enforced)
 
 
 # ------------------------------------------------------------------------------
+#   4b. The third witness -- k_gen against SCN_INJ_MAX (T4 lever 3)
+# ------------------------------------------------------------------------------
+def test_the_k_gen_derate_witness_is_the_injector_limit_at_the_pin(tmp_path):
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, gen_name="G1",
+                       gen_max_mw=200.0, gen_cap_mw=312.0, gen_p_mw=150.0)
+    witness, respected = es.read_witness("k_gen", "derate", "G1", results,
+                                         pin())
+    assert witness == pytest.approx(200.0)
+    assert respected == 1.0, "dispatch stayed under the cap"
+
+
+def test_an_injector_absent_from_the_results_is_not_measured(tmp_path):
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, report_gen=False)
+    witness, respected = es.read_witness("k_gen", "derate", "G1", results,
+                                         pin())
+    assert math.isnan(witness)
+    assert math.isnan(respected)
+
+
+def test_a_zero_dispatch_limit_is_not_measured_and_never_a_cap_of_zero(
+        tmp_path):
+    """
+    MEASURED on the validated run: N111180_1 carries 746 MW of nameplate and
+    reports Max=0 in 125 of 168 RT intervals, the pinned one included, because
+    ED_Inj.md sets Max to zero when a unit is "unavailable for commitment".
+    No admissible step can ask for a cap of zero -- a zero MaxMw without
+    Enforce is ignored, and both partial modes refuse the value -- so a zero
+    here is an unavailable unit.
+
+    Read as a number it is the worst possible reading: constant at zero across
+    every step of a sweep, which W2 reports as the lever never having been
+    applied at all.
+    """
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, gen_name="G1",
+                       gen_max_mw=0.0, gen_cap_mw=746.0, gen_p_mw=0.0)
+    witness, respected = es.read_witness("k_gen", "derate", "G1", results,
+                                         pin())
+    assert math.isnan(witness)
+    assert math.isnan(respected)
+
+
+@pytest.mark.parametrize("p_mw,violation,why", [
+    (260.0, 0.0, "dispatch above the cap"),
+    (150.0, 60.0, "a reported LimitViolation"),
+])
+def test_a_cap_the_solution_overshot_is_reported_as_not_respected(
+        tmp_path, p_mw: float, violation: float, why: str):
+    """
+    W6's question in this table's terms. PSO's injector dispatch limits are
+    SOFT slacks, so a cap that reached the report without constraining the
+    solve shows up as dispatch above it rather than as an infeasibility -- and
+    the limit would otherwise be echoed back from the case file, agreeing with
+    W3 to the digit while having been bought out.
+    """
+    results = tmp_path / "results"
+    write_fake_results(results, load_mw=200.0, gen_name="G1",
+                       gen_max_mw=200.0, gen_cap_mw=312.0, gen_p_mw=p_mw,
+                       gen_limit_violation_mw=violation)
+    witness, respected = es.read_witness("k_gen", "derate", "G1", results,
+                                         pin())
+    assert witness == pytest.approx(200.0), "the cap is still reported"
+    assert respected == 0.0, why
+
+
+def test_the_derate_witness_is_read_back_from_the_layer_not_recomputed(
+        mini_base, tmp_path):
+    """The absolute check compares two independent artifacts: the MW the case
+    file states and the MW the results report. Recomputing the first from the
+    step value would test this module's arithmetic against itself."""
+    layer = tmp_path / "layer"
+    ec.build_stress_layer(
+        mini_base, layer,
+        es.build_step_rows("k_gen", DERATE_GEN, "derate", 200.0),
+        slug="k_gen200")
+    written = es.written_witness("k_gen", "derate", DERATE_GEN, layer)
+    assert written == pytest.approx(200.0)
+
+    rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+    assert [r for r in rows
+            if r["Injector"] == DERATE_GEN and r["MaxMw"] == "200.000"]
+
+
+def test_the_avail_mode_has_no_written_witness_because_it_writes_a_factor(
+        mini_base, tmp_path):
+    """A ScaleFactor is not in the witness's units: the results echo
+    factor x schedule, and the schedule is not in the case file the sweep
+    wrote. That is exactly what 'proportional' means, and claiming an absolute
+    comparison here would compare MW against a multiplier."""
+    layer = tmp_path / "layer"
+    ec.build_stress_layer(
+        mini_base, layer,
+        es.build_step_rows("k_gen", AVAIL_GEN, "avail", 0.8),
+        slug="k_gen0p8")
+    assert math.isnan(es.written_witness("k_gen", "avail", AVAIL_GEN, layer))
+
+
+# ------------------------------------------------------------------------------
+#   4c. Refusing a sweep the case cannot express, at PLAN time
+# ------------------------------------------------------------------------------
+def test_a_derate_of_a_scheduled_injector_is_refused_before_any_solve(
+        mini_base):
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.plan_sweep(mini_base, "k_gen", AVAIL_GEN, "derate",
+                      kmin=200.0, kmax=100.0, kstep=-50.0)
+    message = str(excinfo.value)
+    assert "avail" in message and "_fcst" in message
+
+
+def test_an_avail_sweep_of_an_unscheduled_injector_is_refused(mini_base):
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.plan_sweep(mini_base, "k_gen", DERATE_GEN, "avail",
+                      kmin=1.0, kmax=0.8, kstep=-0.1)
+    assert "derate" in str(excinfo.value)
+
+
+def test_steps_above_the_nameplate_are_refused_as_a_plateau_not_a_sweep(
+        mini_base):
+    """SCN_INJ_MAX can only restrict, so every step above INJ_ID.MaxMw reports
+    the same dispatch limit. In a response curve that reads as a lever that
+    saturated rather than as a case that refused the input."""
+    with pytest.raises(es.Ercot7kSweepError) as excinfo:
+        es.plan_sweep(mini_base, "k_gen", DERATE_GEN, "derate",
+                      kmin=400.0, kmax=200.0, kstep=-50.0)
+    message = str(excinfo.value)
+    assert "275" in message and "SAME dispatch limit" in message
+
+
+def test_steps_below_the_commitment_floor_are_refused(mini_base):
+    """VERIFIED, SCN_INJ_MAX.md: the limit cannot be more restrictive than
+    INJ_CMT.MinDispatch."""
+    with pytest.raises(es.Ercot7kSweepError, match="MinDispatch"):
+        es.plan_sweep(mini_base, "k_gen", DERATE_GEN, "derate",
+                      kmin=100.0, kmax=10.0, kstep=-30.0)
+
+
+def test_an_avail_step_above_one_is_refused(mini_base):
+    with pytest.raises(es.Ercot7kSweepError, match="above 1"):
+        es.plan_sweep(mini_base, "k_gen", AVAIL_GEN, "avail",
+                      kmin=1.2, kmax=0.8, kstep=-0.2)
+
+
+def test_a_valid_derate_sweep_plans_and_carries_its_witness(mini_base):
+    plan = es.plan_sweep(mini_base, "k_gen", DERATE_GEN, "derate",
+                         kmin=275.0, kmax=175.0, kstep=-50.0)
+    assert plan.values == [275.0, 225.0, 175.0]
+    assert plan.witness.column == "ED_Inj.Max"
+    assert plan.as_dict()["witness"]["kind"] == "absolute"
+    assert plan.as_dict()["witness"]["enforcement"] == "respected"
+
+
+# ------------------------------------------------------------------------------
 #   5. The verdict
 # ------------------------------------------------------------------------------
-def _plan(lever="k_load", target="", values=(1.0, 1.1, 1.2)) -> es.SweepPlan:
+def _plan(lever="k_load", target="", values=(1.0, 1.1, 1.2),
+          mode="scale") -> es.SweepPlan:
     return es.SweepPlan(
         sweep_id="t", parent=Path("parent"), lever=lever, target=target,
-        mode="scale", values=list(values), key=pin(), pinned_by=Path("parent"),
+        mode=mode, values=list(values), key=pin(), pinned_by=Path("parent"),
     )
 
 
@@ -712,6 +925,70 @@ def test_enforcement_is_not_a_question_for_a_proportional_lever():
     assert not ec.has_errors(findings)
 
 
+def _kgen_outcomes(rows, mode="derate"):
+    """[(index, value, witness, written, respected), ...] -> outcomes."""
+    return [_outcome(i, v, w, written=wr, enforced=en, lever="k_gen")
+            for i, v, w, wr, en in rows]
+
+
+def test_a_derate_sweep_checks_the_cap_against_the_mw_the_layer_wrote():
+    """The absolute form: the case file's MW against the result file's MW, two
+    independent artifacts, with no reference step."""
+    plan = _plan(lever="k_gen", target="G1", mode="derate",
+                 values=(275.0, 225.0, 175.0))
+    outcomes = _kgen_outcomes([(1, 275.0, 275.0, 275.0, 1.0),
+                               (2, 225.0, 225.0, 225.0, 1.0),
+                               (3, 175.0, 175.0, 175.0, 1.0)])
+    findings = es.check_sweep(plan, outcomes)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK]
+    assert _levels(findings, "W6") == [ec.LEVEL_OK]
+
+
+def test_a_derate_the_solution_overshot_fails_w6_even_though_w3_passes():
+    """The k_gen twin of the k_line enforcement case. The cap is echoed back
+    from the case file at every step -- W3 is perfectly green -- while the
+    solve dispatched through it and paid the slack instead."""
+    plan = _plan(lever="k_gen", target="G1", mode="derate",
+                 values=(275.0, 225.0, 175.0))
+    outcomes = _kgen_outcomes([(1, 275.0, 275.0, 275.0, 1.0),
+                               (2, 225.0, 225.0, 225.0, 0.0),
+                               (3, 175.0, 175.0, 175.0, 0.0)])
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK], "it echoes perfectly"
+    assert _levels(findings, "W6") == [ec.LEVEL_ERROR]
+    assert ec.has_errors(findings)
+
+
+def test_an_avail_sweep_is_checked_as_a_ratio_and_still_asks_about_dispatch():
+    """'avail' scales a schedule, so the level is known only up to the factor
+    and W3 is relative -- but W6 is NOT skipped the way it is for k_load: a
+    scaled schedule can be overshot exactly as a cap can."""
+    plan = _plan(lever="k_gen", target="G1", mode="avail",
+                 values=(1.0, 0.9, 0.8))
+    outcomes = _kgen_outcomes([(1, 1.0, 100.0, math.nan, 1.0),
+                               (2, 0.9, 90.0, math.nan, 1.0),
+                               (3, 0.8, 80.0, math.nan, 1.0)])
+    findings = es.check_sweep(plan, outcomes)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK]
+    assert _levels(findings, "W6") == [ec.LEVEL_OK]
+
+
+def test_a_derate_witness_missing_at_the_pin_names_the_uncommitted_unit():
+    """The W1 message has to send the operator to the right place: ED_Inj
+    reports every injector, so an absent witness here is not the PN_Pth
+    reporting-scope problem -- it is a unit that was off at the pinned hour."""
+    plan = _plan(lever="k_gen", target="G1", mode="derate",
+                 values=(275.0, 225.0))
+    outcomes = _kgen_outcomes([(1, 275.0, math.nan, 275.0, math.nan),
+                               (2, 225.0, math.nan, 225.0, math.nan)])
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W1") == [ec.LEVEL_ERROR]
+    message = next(f.message for f in findings if f.check == "W1")
+    assert "committed" in message and "G1" in message
+
+
 def test_a_non_optimal_step_warns_rather_than_failing():
     plan = _plan()
     outcomes = [_outcome(1, 1.0, 200.0), _outcome(2, 1.1, 220.0),
@@ -749,10 +1026,77 @@ def _deaf_solver(runs_root: Path):
     return run_fn
 
 
+def _honest_derate_solver(runs_root: Path):
+    """
+    The same idea for k_gen: a fake PSO that reads the layer's own
+    SCN_INJ_MAX.MaxMw and reports it back as ED_Inj.Max, dispatching under it.
+
+    This is the chain the two scripts share, so it is the one place a step
+    value that reached the config row but not the case file would show.
+    """
+    def run_fn(case_csv, run_name, root):
+        layer = Path(case_csv).parent
+        rows = ec.read_table(layer / "texas7k_SCN_INJ_MAX.csv").records()
+        cap = next(float(r["MaxMw"]) for r in rows
+                   if r["Injector"] == DERATE_GEN and r["MaxMw"])
+        results = Path(runs_root) / run_name / "results"
+        write_fake_results(results, load_mw=BASE_LOAD_MW,
+                           gen_name=DERATE_GEN, gen_max_mw=cap,
+                           gen_cap_mw=275.0, gen_p_mw=cap / 2.0)
+        return 0, results, 0.5
+    return run_fn
+
+
 def _sweep_plan_for(mini_base: Path) -> es.SweepPlan:
     return es.plan_sweep(parent=mini_base, lever="k_load", target="",
                          mode="scale", kmin=1.0, kmax=1.2, kstep=0.1,
                          sweep_id="unit")
+
+
+def test_the_whole_loop_carries_a_derate_from_the_config_row_to_the_verdict(
+        mini_base, tmp_path):
+    """T4 lever 3 end to end: config row -> stress_deltas -> SCN_INJ_MAX ->
+    results -> witness -> verdict, with only the solve faked."""
+    runs = tmp_path / "runs"
+    plan = es.plan_sweep(parent=mini_base, lever="k_gen", target=DERATE_GEN,
+                         mode="derate", kmin=275.0, kmax=175.0, kstep=-50.0,
+                         sweep_id="kgen")
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived", runs_root=runs,
+                            run_fn=_honest_derate_solver(runs))
+
+    assert all(o.ok() for o in outcomes), [o.error for o in outcomes]
+    assert [round(o.witness, 3) for o in outcomes] == [275.0, 225.0, 175.0]
+    # The layer is read for the expected value, not recomputed from the step.
+    assert [round(o.witness_written, 3) for o in outcomes] == [275.0, 225.0,
+                                                               175.0]
+    findings = es.check_sweep(plan, outcomes)
+    assert not ec.has_errors(findings), ec.format_findings(findings)
+    assert _levels(findings, "W3") == [ec.LEVEL_OK]
+    assert _levels(findings, "W6") == [ec.LEVEL_OK]
+
+
+def test_the_loop_catches_a_solver_that_ignores_a_derate(mini_base, tmp_path):
+    """devnet's defect 1 on the new lever: the steps are labelled and the case
+    is not applied. The witness is constant, and W2 says so."""
+    runs = tmp_path / "runs"
+    plan = es.plan_sweep(parent=mini_base, lever="k_gen", target=DERATE_GEN,
+                         mode="derate", kmin=275.0, kmax=175.0, kstep=-50.0,
+                         sweep_id="kgendeaf")
+
+    def deaf(case_csv, run_name, root):
+        results = Path(runs) / run_name / "results"
+        write_fake_results(results, load_mw=BASE_LOAD_MW, gen_name=DERATE_GEN,
+                           gen_max_mw=275.0, gen_cap_mw=275.0, gen_p_mw=100.0)
+        return 0, results, 0.5
+
+    outcomes = es.run_sweep(plan, sweeps_root=tmp_path / "sweeps",
+                            derived_root=tmp_path / "derived", runs_root=runs,
+                            run_fn=deaf)
+    assert all(o.ok() for o in outcomes), "every step 'succeeded'"
+    findings = es.check_sweep(plan, outcomes)
+    assert _levels(findings, "W2") == [ec.LEVEL_ERROR]
+    assert ec.has_errors(findings)
 
 
 def test_the_whole_loop_builds_solves_maps_and_passes(mini_base, tmp_path):
@@ -1379,7 +1723,7 @@ def test_pruning_keeps_the_tables_the_costs_are_re_derivable_from(tmp_path):
         assert (results / ("results_%s.csv" % name)).is_file()
     # Still readable for the two figures the summary stands on.
     assert er.objective_by_cycle(results)["RT"] == pytest.approx(3000.0)
-    witness, _ = es.read_witness("k_load", "", results, pin())
+    witness, _ = es.read_witness("k_load", "scale", "", results, pin())
     assert witness == pytest.approx(200.0)
 
 

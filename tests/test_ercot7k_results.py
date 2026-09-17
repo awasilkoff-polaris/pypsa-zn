@@ -257,6 +257,61 @@ def test_the_pin_is_not_the_peak_load_interval_because_that_hour_is_idle():
     assert loads[pinned] < loads[peak]
 
 
+def test_ed_inj_max_echoes_the_nameplate_of_an_uncapped_thermal_unit():
+    """
+    The premise of the k_gen derate witness, measured rather than assumed.
+    ED_Inj.md says Max is "de-rated by ... dispatch limits (SCN_INJ_MAX)", so
+    on an uncapped unit it must read the nameplate back -- which is what makes
+    a capped one's reading an echo of the case file rather than a response.
+
+    N210336_1 is TEMPLE 7 2, 312 MW, no SCN_INJ_MAX row, committed in all 168
+    RT intervals of this run.
+    """
+    limits = er.injector_limit_by_interval(REAL_RESULTS, "RT", "ScnRT",
+                                           "N210336_1")
+    assert len(limits) == 168
+    assert {round(v["max_mw"], 3) for v in limits.values()} == {312.0}
+    at_pin = limits[REAL_PIN_INTERVAL["RT"]]
+    assert at_pin["cap_mw"] == pytest.approx(312.0)
+    assert at_pin["p_mw"] <= at_pin["max_mw"]
+    assert at_pin["limit_violation_mw"] == pytest.approx(0.0)
+
+
+def test_ed_inj_max_follows_the_schedule_of_a_renewable_and_reaches_zero():
+    """
+    The other population, and the reason its mode is proportional rather than
+    absolute: what the results echo is the schedule, so the level is known only
+    up to the factor. N220149_1 is King Mountain Wind Ranch 1: 278 MW of
+    nameplate, 134 distinct Max values over the window, and 6 hours at zero.
+    """
+    limits = er.injector_limit_by_interval(REAL_RESULTS, "RT", "ScnRT",
+                                           "N220149_1")
+    assert len({round(v["max_mw"], 3) for v in limits.values()}) > 100
+    assert all(v["cap_mw"] == pytest.approx(278.0) for v in limits.values())
+    assert any(v["max_mw"] == 0.0 for v in limits.values())
+
+
+def test_ed_inj_max_is_zero_for_a_unit_the_solve_did_not_commit():
+    """
+    Measured, and it is why read_witness() refuses to report a zero Max as a
+    witness. N111180_1 is 746 MW of nameplate reading Max=0 in 125 of 168 RT
+    intervals -- the pinned one included -- because ED_Inj.md sets Max to zero
+    when a unit is "unavailable for commitment". Read as a number, a derate
+    sweep on this unit would be constant at zero across every step and W2
+    would report the sweep as never having happened.
+    """
+    limits = er.injector_limit_by_interval(REAL_RESULTS, "RT", "ScnRT",
+                                           "N111180_1")
+    assert limits[REAL_PIN_INTERVAL["RT"]]["max_mw"] == 0.0
+    assert limits[REAL_PIN_INTERVAL["RT"]]["cap_mw"] == pytest.approx(746.0)
+    assert sum(1 for v in limits.values() if v["max_mw"] == 0.0) > 100
+
+
+def test_an_injector_absent_from_the_results_is_absent_from_the_mapping():
+    assert er.injector_limit_by_interval(REAL_RESULTS, "RT", "ScnRT",
+                                         "NOT_AN_INJECTOR") == {}
+
+
 def test_the_binding_count_leads_and_the_spread_only_breaks_ties():
     """
     Binding count is the primary key, so the widest-spread interval of the

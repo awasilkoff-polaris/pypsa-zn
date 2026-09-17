@@ -179,6 +179,21 @@ class Ercot7kSweepError(Exception):
 #                   the result file and needs no reference step.
 #   proportional -- the results carry a quantity that scales with the lever, so
 #                   the check is observed[i]/observed[0] == value[i]/value[0].
+#
+# enforcement -- how W6 can ask "and was that value in the LP?", which is a
+# different question per table and must not be answered by analogy:
+#   bit          -- the results carry an explicit enforcement flag beside the
+#                   limit (PN_Pth.MinEnforced/MaxEnforced).
+#   respected    -- there is no flag because the limit is structural, so the
+#                   evidence is that dispatch obeyed it: PSO's injector
+#                   dispatch limits are soft slacks, so a cap reported and not
+#                   applied shows as ED_Inj.LimitViolation.
+#   none         -- the quantity is consumed unconditionally and the question
+#                   does not arise (area load).
+#
+# Keyed by (lever, MODE), not by lever. k_gen writes three different tables
+# depending on its mode, two of them sweepable and one not, and a witness chosen
+# by lever alone would read SCN_INJ_MAX for a sweep that wrote SCN_INJ_OUT.
 # ------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Witness:
@@ -186,52 +201,85 @@ class Witness:
     column: str
     unit: str
     note: str
+    enforcement: str = "none"
 
 
-WITNESSES: Dict[str, Witness] = {
-    "k_line": Witness(
+WITNESSES: Dict[Tuple[str, str], Witness] = {
+    ("k_line", "scale"): Witness(
         kind="absolute",
         column="PN_Pth.Max",
         unit="MW",
+        enforcement="bit",
         note=("the enforced flow limit on the derated branch at the pinned "
               "interval, which is BRN_ID.NormalLimit as this step's "
               "SCN_BRN_LMT row amended it"),
     ),
-    "k_load": Witness(
+    ("k_load", "scale"): Witness(
         kind="proportional",
         column="ED_Ara.Load",
         unit="MW",
+        enforcement="none",
         note=("fixed area load at the pinned interval, summed over areas. "
               "ED_Ara.Load is documented as unaffected by Violation, i.e. an "
               "input echo rather than served load, which is what makes it a "
               "witness and not a response"),
     ),
+    ("k_gen", "derate"): Witness(
+        kind="absolute",
+        column="ED_Inj.Max",
+        unit="MW",
+        enforcement="respected",
+        note=("the dispatch limit on the derated generator at the pinned "
+              "interval. ED_Inj.md: Max is 'de-rated by ... dispatch limits "
+              "(SCN_INJ_MAX)', so on a capped unit it is this step's MaxMw "
+              "read back out of the solution"),
+    ),
+    ("k_gen", "avail"): Witness(
+        kind="proportional",
+        column="ED_Inj.Max",
+        unit="MW",
+        enforcement="respected",
+        note=("the dispatch limit on the scaled generator at the pinned "
+              "interval. The lever scales an availability SCHEDULE, so what "
+              "the results echo is factor x schedule(interval) -- known only "
+              "up to the factor, which is why this mode is proportional where "
+              "'derate' is absolute"),
+    ),
 }
 
-# Levers a sweep can walk. k_gen is deliberately absent: SCN_INJ_OUT.Outage is
-# a BIT, the lever takes the value 1 and nothing else, and a value axis with one
-# admissible point is not a sweep. A partial generator derate IS sweepable and
-# is a different lever against SCN_INJ_MAX (T4 lever 3), not yet built.
-SWEEPABLE: Tuple[str, ...] = tuple(sorted(WITNESSES))
+# The (lever, mode) pairs a sweep can walk. k_gen's third mode, 'outage', is
+# deliberately absent: SCN_INJ_OUT.Outage is a BIT, the mode takes the value 1
+# and nothing else, and a value axis with one admissible point is not a sweep.
+SWEEPABLE: Tuple[Tuple[str, str], ...] = tuple(sorted(WITNESSES))
 
 
-def witness_for(lever: str) -> Witness:
-    witness = WITNESSES.get(lever)
-    if witness is None:
-        entry = ec.STRESS_LEVERS.get(lever)
-        if entry is None:
-            raise Ercot7kSweepError(
-                "lever %r is not implemented at all. Implemented levers: %s. "
-                "Sweepable levers: %s."
-                % (lever, ", ".join(sorted(ec.STRESS_LEVERS)),
-                   ", ".join(SWEEPABLE)))
+def sweepable_text() -> str:
+    return ", ".join("%s/%s" % pair for pair in SWEEPABLE)
+
+
+def witness_for(lever: str, mode: str) -> Witness:
+    witness = WITNESSES.get((lever, mode))
+    if witness is not None:
+        return witness
+
+    entry = ec.STRESS_LEVERS.get(lever)
+    if entry is None:
         raise Ercot7kSweepError(
-            "lever %s is implemented but cannot be swept: it takes mode(s) %s, "
-            "and this driver only sweeps a lever whose value is a continuous "
-            "axis with a readable witness. %s Sweepable levers: %s."
-            % (lever, ", ".join(entry["modes"]), entry["note"],
-               ", ".join(SWEEPABLE)))
-    return witness
+            "lever %r is not implemented at all. Implemented levers: %s. "
+            "Sweepable lever/mode pairs: %s."
+            % (lever, ", ".join(sorted(ec.STRESS_LEVERS)), sweepable_text()))
+    if mode not in entry["modes"]:
+        raise Ercot7kSweepError(
+            "lever %s does not implement mode %r; it implements %s. Sweepable "
+            "lever/mode pairs: %s."
+            % (lever, mode, ", ".join(entry["modes"]), sweepable_text()))
+    raise Ercot7kSweepError(
+        "lever %s implements mode %s, but that pair cannot be swept: it "
+        "writes %s, and this driver only sweeps a value that is a continuous "
+        "axis with a readable witness. %s Sweepable lever/mode pairs: %s."
+        % (lever, mode,
+           (entry.get("mode_tables") or {}).get(mode, entry.get("table", "?")),
+           entry["note"], sweepable_text()))
 
 
 # ------------------------------------------------------------------------------
@@ -394,7 +442,7 @@ def build_step_rows(lever: str, target: str, mode: str, value: float,
 # is a documented PSO meaning ("if NormalLimit = 0, limits are ignored"), i.e.
 # the one value that must never be invented.
 # ------------------------------------------------------------------------------
-def read_witness(lever: str, target: str, results_dir: Path,
+def read_witness(lever: str, mode: str, target: str, results_dir: Path,
                  key: er.ReportKey) -> Tuple[float, float]:
     """
     Returns (witness, enforced) at the pinned interval.
@@ -414,9 +462,17 @@ def read_witness(lever: str, target: str, results_dir: Path,
 
     k_load has no equivalent question -- area load is consumed by the power
     balance unconditionally -- so it reports enforcement as NaN, meaning "not
-    applicable", and W6 skips it by lever kind rather than by value.
+    applicable", and W6 skips it by enforcement kind rather than by value.
+
+    For k_gen there is no enforcement flag to read, because an injector
+    dispatch limit is structural rather than discovered. What can be read is
+    whether the solution OBEYED it, and that is a real question and not a
+    tautology: PSO's dispatch limits are soft slacks, so a cap the LP did not
+    apply appears as a positive ED_Inj.LimitViolation rather than as an
+    infeasible solve.
     """
-    witness_for(lever)  # refuses an unsweepable lever before touching the disk
+    # Refuses an unsweepable lever/mode before touching the disk.
+    witness_for(lever, mode)
     results_dir = Path(results_dir)
     if lever == "k_line":
         limits = er.path_limit_by_interval(results_dir, key.cycle,
@@ -430,6 +486,38 @@ def read_witness(lever: str, target: str, results_dir: Path,
                                               key.scenario)
         entry = metrics.get(key.interval)
         return (entry["load_mw"] if entry else math.nan), math.nan
+    if lever == "k_gen":
+        limits = er.injector_limit_by_interval(results_dir, key.cycle,
+                                               key.scenario, target)
+        entry = limits.get(key.interval)
+        if entry is None:
+            return math.nan, math.nan
+        # A Max of zero is NOT MEASURED, never a cap of zero. ED_Inj.md: Max
+        # "is set to zero when off due to scheduled outage, forced outage,
+        # failed startup, or unavailable for commitment" -- 33,675 of the
+        # validated run's 106,848 RT rows are exactly that -- while no
+        # admissible step can ask for a cap of zero, because a zero MaxMw
+        # without Enforce is ignored and both partial modes refuse the value.
+        # So a zero here is an unavailable unit and cannot have come from the
+        # lever. Reported as a number it would be read as the deepest possible
+        # derate: W3 would call the sweep broken, and on a sweep where the unit
+        # was uncommitted at every step the witness would be perfectly constant
+        # and W2 would call the lever unapplied.
+        if entry["max_mw"] == 0.0:
+            return math.nan, math.nan
+        # The enforcement half rests on P against Max, which are both columns
+        # this reader requires; LimitViolation corroborates it where the
+        # results carry it. Unreadable dispatch is UNKNOWN rather than
+        # respected, so that W6 can say so instead of passing on nothing.
+        if not (_finite(entry["p_mw"]) and _finite(entry["max_mw"])):
+            return entry["max_mw"], math.nan
+        respected = 1.0
+        if entry["p_mw"] > entry["max_mw"] + WITNESS_ATOL:
+            respected = 0.0
+        if (_finite(entry["limit_violation_mw"])
+                and entry["limit_violation_mw"] > 0.0):
+            respected = 0.0
+        return entry["max_mw"], respected
     raise Ercot7kSweepError(
         "lever %s is in WITNESSES but read_witness() has no branch for it"
         % lever)
@@ -446,18 +534,28 @@ def read_witness(lever: str, target: str, results_dir: Path,
 # returned -- two independent artifacts -- and that is the comparison that can
 # actually fail.
 # ------------------------------------------------------------------------------
-def written_witness(lever: str, target: str, layer_dir: Path) -> float:
-    if WITNESSES[lever].kind != "absolute":
+def written_witness(lever: str, mode: str, target: str,
+                    layer_dir: Path) -> float:
+    if witness_for(lever, mode).kind != "absolute":
         return math.nan
     layer_dir = Path(layer_dir)
+    prefix = ec.case_prefix(layer_dir)
     if lever == "k_line":
-        prefix = ec.case_prefix(layer_dir)
         path = layer_dir / ("%s_SCN_BRN_LMT.csv" % prefix)
         if not path.is_file():
             return math.nan
         for record in ec.read_table(path).records():
             if record.get("Branch") == target and record.get("Scenario") == "0":
                 return _as_float(record.get("NormalLimit", ""))
+        return math.nan
+    if lever == "k_gen" and mode == "derate":
+        path = layer_dir / ("%s_SCN_INJ_MAX.csv" % prefix)
+        if not path.is_file():
+            return math.nan
+        for record in ec.read_table(path).records():
+            if (record.get("Injector") == target
+                    and record.get("Scenario") == "0"):
+                return _as_float(record.get("MaxMw", ""))
         return math.nan
     return math.nan
 
@@ -495,6 +593,13 @@ class SweepPlan:
     slug_prefix: str = ""
     decimals: int = DEFAULT_DECIMALS
 
+    @property
+    def witness(self) -> Witness:
+        """The (lever, mode) pair's witness. A property rather than a stored
+        field so that a plan read back from sweep.json cannot carry a witness
+        that disagrees with the lever and mode beside it."""
+        return witness_for(self.lever, self.mode)
+
     def slug(self, value: float) -> str:
         return step_slug(self.lever, value, self.slug_prefix, self.decimals)
 
@@ -513,7 +618,27 @@ class SweepPlan:
         exactly what the marker recorded -- so it could only ever disagree if
         someone hand-edited it.
         """
-        payload = {key: self.as_dict()[key] for key in PLAN_IDENTITY}
+        # Built from the identity fields directly rather than by taking a
+        # slice of as_dict(). as_dict() also resolves the witness, which is a
+        # property of the (lever, mode) pair and refuses a pair that cannot be
+        # swept -- a correct refusal in a sweep record, and an unwanted one in
+        # a hash whose only job is to say whether two plans are the same.
+        payload: Dict[str, Any] = {
+            "parent": str(self.parent),
+            "lever": self.lever,
+            "target": self.target,
+            "mode": self.mode,
+            "values": list(self.values),
+            "slug_prefix": self.slug_prefix,
+            "decimals": self.decimals,
+        }
+        missing = sorted(set(PLAN_IDENTITY) - set(payload))
+        if missing:
+            raise Ercot7kSweepError(
+                "identity_digest() does not hash %s, which PLAN_IDENTITY says "
+                "is part of a sweep's identity: two sweeps differing only "
+                "there would share a digest and each other's results."
+                % ", ".join(missing))
         payload["report"] = self.key.as_dict()
         text = json.dumps(payload, sort_keys=True, ensure_ascii=True)
         return hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
@@ -534,10 +659,11 @@ class SweepPlan:
             "report": self.key.as_dict(),
             "pinned_by": str(self.pinned_by),
             "witness": {
-                "kind": WITNESSES[self.lever].kind,
-                "column": WITNESSES[self.lever].column,
-                "unit": WITNESSES[self.lever].unit,
-                "note": WITNESSES[self.lever].note,
+                "kind": self.witness.kind,
+                "column": self.witness.column,
+                "unit": self.witness.unit,
+                "enforcement": self.witness.enforcement,
+                "note": self.witness.note,
             },
         }
 
@@ -593,8 +719,21 @@ def resolve_pin(case_dir: Path) -> Tuple[er.ReportKey, Path]:
 # The shipped case is clean -- both SCN_ARA_LOD rows carry a schedule and a
 # blank Load -- so this is a guard against the case changing, which is why it
 # names the rows rather than just refusing.
+#
+# k_gen asks the same question of the other table. Its two partial modes write
+# the SAME FIELD FAMILY to two disjoint populations of injector, and the wrong
+# one for the population is not an error in PSO -- it is a row that reads as a
+# derate and is discarded (a static MaxMw beside a schedule that outranks it; a
+# ScaleFactor with no schedule to scale). ercot7k_case.py refuses both when the
+# layer is built, which is already before the solve; refusing here as well is
+# what stops a plan being ACCEPTED, printed with a projected cost and a step
+# list, and then dying on step 1.
 # ------------------------------------------------------------------------------
-def assert_witness_can_see_the_lever(parent: Path, lever: str) -> None:
+def assert_witness_can_see_the_lever(parent: Path, lever: str,
+                                     mode: str = "", target: str = "") -> None:
+    if lever == "k_gen":
+        _assert_injector_population(Path(parent), mode, target)
+        return
     if lever != "k_load":
         return
     parent = Path(parent)
@@ -618,6 +757,105 @@ def assert_witness_can_see_the_lever(parent: Path, lever: str) -> None:
            ", ".join("scenario %s area %s" % (r.get("Scenario", ""),
                                               r.get("Area", ""))
                      for r in static[:4])))
+
+
+def _injector_max_rows(parent: Path, injector: str) -> List[Dict[str, str]]:
+    path = parent / ("%s_SCN_INJ_MAX.csv" % ec.case_prefix(parent))
+    if not path.is_file():
+        return []
+    return [r for r in ec.read_table(path).records()
+            if r.get("Injector") == injector]
+
+
+def _assert_injector_population(parent: Path, mode: str, target: str) -> None:
+    rows = _injector_max_rows(parent, target)
+    if mode == "derate" and rows:
+        raise Ercot7kSweepError(
+            "%s already carries %d SCN_INJ_MAX row(s) (%s), so mode 'derate' "
+            "-- a static MaxMw -- cannot reach it: Sequence and Schedule both "
+            "outrank the static value, and those schedules cover every "
+            "interval. Sweep it with mode 'avail', which scales the schedule."
+            % (target, len(rows),
+               ", ".join("%s -> %s" % (r.get("Scenario", ""),
+                                       r.get("Schedule") or "(none)")
+                         for r in rows[:4])))
+    if mode == "avail" and not rows:
+        raise Ercot7kSweepError(
+            "%s carries no SCN_INJ_MAX row, so mode 'avail' has no Schedule or "
+            "Sequence to scale and a ScaleFactor on it would state nothing. "
+            "Sweep it with mode 'derate', which writes an absolute MaxMw in MW."
+            % target)
+
+
+# ------------------------------------------------------------------------------
+# assert_values_admissible()
+#
+# Every step of the plan, against the ceiling and floor the case states, before
+# any of them is solved.
+#
+# A sweep is where an out-of-range value stops being a refusal and starts being
+# a PLATEAU: SCN_INJ_MAX can only restrict, so k_gen derate steps above the
+# nameplate all report the same number, and a reader of the response curve sees
+# a lever that saturated rather than a case that refused. The layer writer
+# refuses each of them, but it refuses them one at a time, six minutes apart,
+# after the earlier steps have already been solved and written.
+# ------------------------------------------------------------------------------
+def assert_values_admissible(parent: Path, lever: str, mode: str, target: str,
+                             values: Sequence[float]) -> None:
+    if lever != "k_gen":
+        return
+    parent = Path(parent)
+    if mode == "avail":
+        over = [v for v in values if v > 1.0]
+        if over:
+            raise Ercot7kSweepError(
+                "mode 'avail' scales an availability schedule and can only "
+                "restrict it, so %d step(s) above 1.0 (%s) would ask the case "
+                "for capacity the schedule never claimed."
+                % (len(over), ", ".join(value_text(v) for v in over[:5])))
+        return
+    if mode != "derate":
+        return
+
+    prefix = ec.case_prefix(parent)
+    nameplate = math.nan
+    path = parent / ("%s_INJ_ID.csv" % prefix)
+    if path.is_file():
+        for record in ec.read_table(path).records():
+            if record.get("Injector") == target:
+                nameplate = _as_float(record.get("MaxMw", ""))
+                break
+    if math.isnan(nameplate):
+        raise Ercot7kSweepError(
+            "%s is not in INJ_ID, so there is no nameplate to sweep below. "
+            "The target of k_gen is an Injector key, not a node or a "
+            "substation name." % target)
+    over = [v for v in values if v > nameplate]
+    if over:
+        raise Ercot7kSweepError(
+            "%d step(s) ask for more than %s's INJ_ID.MaxMw of %s (%s). "
+            "SCN_INJ_MAX can only restrict, never raise, so every one of them "
+            "would report the SAME dispatch limit and read as a saturated "
+            "lever rather than as a refused input."
+            % (len(over), target, _fmt(nameplate),
+               ", ".join(value_text(v) for v in over[:5])))
+
+    floor = math.nan
+    path = parent / ("%s_INJ_CMT.csv" % prefix)
+    if path.is_file():
+        for record in ec.read_table(path).records():
+            if record.get("Injector") == target:
+                floor = _as_float(record.get("MinDispatch", ""))
+                break
+    under = [v for v in values if _finite(floor) and v < floor]
+    if under:
+        raise Ercot7kSweepError(
+            "%d step(s) ask for less than %s's INJ_CMT.MinDispatch of %s (%s). "
+            "VERIFIED, SCN_INJ_MAX.md: 'Limit cannot be more restrictive than "
+            "MinDispatch (INJ_CMT).' Stop the sweep at the floor, or take the "
+            "unit out entirely with mode 'outage'."
+            % (len(under), target, _fmt(floor),
+               ", ".join(value_text(v) for v in under[:5])))
 
 
 # The characters Windows refuses in a file name, plus the separators. A name
@@ -678,13 +916,11 @@ def plan_sweep(parent: Path, lever: str, target: str, mode: str,
                slug_prefix: str = "",
                decimals: int = DEFAULT_DECIMALS) -> SweepPlan:
     parent = Path(parent).resolve()
-    witness_for(lever)
+    # Refuses an unimplemented lever, an unimplemented mode and an
+    # implemented-but-unsweepable pair, each naming what it is.
+    witness_for(lever, mode)
 
     entry = ec.STRESS_LEVERS[lever]
-    if mode not in entry["modes"]:
-        raise Ercot7kSweepError(
-            "lever %s does not implement mode %r; it implements %s"
-            % (lever, mode, ", ".join(entry["modes"])))
     if entry["target"] == "blank" and target:
         raise Ercot7kSweepError(
             "lever %s takes a blank target: %s" % (lever, entry["note"]))
@@ -693,8 +929,9 @@ def plan_sweep(parent: Path, lever: str, target: str, mode: str,
             "lever %s needs a %s as its target: %s"
             % (lever, entry["target"], entry["note"]))
 
-    assert_witness_can_see_the_lever(parent, lever)
+    assert_witness_can_see_the_lever(parent, lever, mode, target)
     values = sweep_steps(kmin, kmax, kstep, decimals)
+    assert_values_admissible(parent, lever, mode, target, values)
     key, pinned_by = resolve_pin(parent)
 
     if sweep_id is None:
@@ -1056,13 +1293,14 @@ def _run_one_step(plan: SweepPlan, index: int, value: float,
         # lever did not reach the solver, every other number in this row is a
         # correct measurement of the wrong case.
         outcome.witness, outcome.witness_enforced = read_witness(
-            plan.lever, plan.target, results_dir, plan.key)
-        outcome.witness_written = written_witness(plan.lever, plan.target,
-                                                  layer)
+            plan.lever, plan.mode, plan.target, results_dir, plan.key)
+        outcome.witness_written = written_witness(plan.lever, plan.mode,
+                                                  plan.target, layer)
         say("  witness %s = %s %s (layer wrote %s)%s"
-            % (WITNESSES[plan.lever].column, _fmt(outcome.witness),
-               WITNESSES[plan.lever].unit, _fmt(outcome.witness_written),
-               _enforced_text(plan.lever, outcome.witness_enforced)))
+            % (plan.witness.column, _fmt(outcome.witness),
+               plan.witness.unit, _fmt(outcome.witness_written),
+               _enforced_text(plan.lever, plan.mode,
+                              outcome.witness_enforced)))
 
         run = map_fn(results_dir, interval=plan.key.interval,
                      cycle=plan.key.cycle, scenario=plan.key.scenario,
@@ -1336,7 +1574,7 @@ def _dir_mb(path: Path) -> float:
 def check_sweep(plan: SweepPlan,
                 outcomes: Sequence[StepOutcome]) -> List[ec.Finding]:
     findings: List[ec.Finding] = []
-    witness = WITNESSES[plan.lever]
+    witness = plan.witness
     done = [o for o in outcomes if o.ok()]
 
     if len(done) < len(plan.values):
@@ -1380,6 +1618,17 @@ def check_sweep(plan: SweepPlan,
                       "then carries the question of whether the limit was "
                       "actually enforced, which is the part that matters."
                       % plan.target)
+        if plan.lever == "k_gen":
+            detail = (" ED_Inj reports every injector in every interval, so an "
+                      "absent witness here is NOT the PN_Pth reporting-scope "
+                      "problem. It is read_witness() refusing to report a "
+                      "Max of 0 under a positive Cap: ED_Inj.md sets Max to "
+                      "zero when a unit is off or was not committed, and "
+                      "neither partial mode can ask for a cap of zero, so that "
+                      "reading is an unavailable unit rather than a derated "
+                      "one. Injector %r was off at the pinned interval on "
+                      "those steps -- pin an interval where it runs, or sweep "
+                      "a unit that is committed there." % plan.target)
         # Severity follows W6's rule, and for the same physical reason: a
         # corridor slack at the top of the range and binding at the bottom is
         # the experiment worth running, and this check used to fail it with an
@@ -1624,14 +1873,65 @@ def _check_witness_matches_input(plan: SweepPlan,
 # is a sweep where the limit was enforced at no step at all: there the lever
 # moved a number that never reached the solver.
 # ------------------------------------------------------------------------------
+# For k_gen there is no enforcement flag to read, and inventing an analogue of
+# one would be the worse answer. An injector dispatch limit is not discovered
+# the way a branch limit is: SCN_INJ_MAX restricts ED's own Max directly, so the
+# question "did it reach the LP" has a different observable -- whether dispatch
+# OBEYED it. That is a check with teeth rather than a tautology only because
+# PSO's dispatch limits are SOFT: ED_Inj.LimitViolation is "(MW) violation of
+# dispatch limits", so a cap reported and not applied shows up as a positive
+# violation instead of an infeasible solve.
+#
+# It is a weaker claim than k_line's and says so. What it cannot distinguish is
+# a cap that was applied from a cap that was never binding, which is why the
+# absolute comparison in W3 carries the weight here: the MW in the case file
+# against the MW in the result file, two independent artifacts.
 def _check_enforced(plan: SweepPlan, measured: Sequence[StepOutcome],
                     witness: Witness) -> ec.Finding:
-    if witness.kind != "absolute":
+    if witness.enforcement == "none":
         return ec.Finding(
             "W6", ec.LEVEL_SKIP,
             "%s is consumed unconditionally by the power balance, so there is "
             "no separate 'was it enforced' question for %s"
             % (witness.column, plan.lever))
+
+    if witness.enforcement == "respected":
+        known = [o for o in measured if _finite(o.witness_enforced)]
+        if not known:
+            return ec.Finding(
+                "W6", ec.LEVEL_WARNING,
+                "no step reports a readable ED_Inj.P beside %s, so whether "
+                "dispatch respected the cap cannot be established. The cap on "
+                "its own is an echo of the case file: treat W3 as proof that "
+                "the case was written, not that it constrained the solve."
+                % witness.column)
+        broken = [o for o in known if o.witness_enforced != 1.0]
+        if broken:
+            return ec.Finding(
+                "W6", ec.LEVEL_ERROR,
+                "%s was reported at every step, but at %d of %d the solution "
+                "dispatched %s ABOVE it (ED_Inj.LimitViolation is positive, or "
+                "P exceeds Max): %s. PSO's injector dispatch limits are soft "
+                "slacks, so a cap that was written and reported can still be "
+                "bought out rather than enforced -- read those steps as a "
+                "priced overshoot, not as a derate."
+                % (witness.column, len(broken), len(known), plan.target,
+                   ", ".join("%s=%s" % (plan.lever,
+                                        value_text(o.value, plan.decimals))
+                             for o in broken[:5])))
+        return ec.Finding(
+            "W6", ec.LEVEL_OK,
+            "dispatch of %s stayed at or below %s with no LimitViolation at "
+            "all %d measured steps, so the cap was a constraint on the "
+            "solution and not only a number in the report"
+            % (plan.target, witness.column, len(known)))
+
+    if witness.enforcement != "bit":
+        raise Ercot7kSweepError(
+            "witness %s declares enforcement %r, which _check_enforced() has "
+            "no branch for. A new enforcement kind needs its own check, not "
+            "the branch-limit one by default."
+            % (witness.column, witness.enforcement))
 
     known = [o for o in measured if _finite(o.witness_enforced)]
     if not known:
@@ -1675,9 +1975,14 @@ def _check_enforced(plan: SweepPlan, measured: Sequence[StepOutcome],
         "case file" % (len(enforced), witness.column))
 
 
-def _enforced_text(lever: str, enforced: float) -> str:
-    if WITNESSES[lever].kind != "absolute":
+def _enforced_text(lever: str, mode: str, enforced: float) -> str:
+    witness = witness_for(lever, mode)
+    if witness.enforcement == "none":
         return ""
+    if witness.enforcement == "respected":
+        if not _finite(enforced):
+            return "  [cap respected: unknown -- no LimitViolation column]"
+        return "  [cap respected: %s]" % ("yes" if enforced == 1.0 else "NO")
     if not _finite(enforced):
         return "  [enforced: unknown -- no MaxEnforced column]"
     return "  [enforced: %s]" % ("yes" if enforced == 1.0 else "NO")
@@ -1733,7 +2038,7 @@ TAIL_COLUMNS: Tuple[str, ...] = ("layer", "run_dir", "error")
 
 def summary_rows(plan: SweepPlan,
                  outcomes: Sequence[StepOutcome]) -> List[Dict[str, Any]]:
-    witness = WITNESSES[plan.lever]
+    witness = plan.witness
     rows: List[Dict[str, Any]] = []
     reference = next((o for o in outcomes if o.ok() and _finite(o.witness)),
                      None)
@@ -1865,7 +2170,7 @@ def read_outcomes(sweep_dir: Path) -> List[StepOutcome]:
 
 def report_text(plan: SweepPlan, outcomes: Sequence[StepOutcome],
                 findings: Sequence[ec.Finding]) -> str:
-    witness = WITNESSES[plan.lever]
+    witness = plan.witness
     lines: List[str] = []
     lines.append(SECTION_SEPARATOR.rstrip("\n"))
     lines.append("ercot7k sweep report -- %s" % plan.sweep_id)
@@ -1974,10 +2279,16 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--parent", required=True,
                         help="the case directory each step builds on")
     parser.add_argument("--lever", required=True,
-                        help="sweepable levers: %s" % ", ".join(SWEEPABLE))
+                        help="sweepable lever/mode pairs: %s"
+                             % sweepable_text())
     parser.add_argument("--target", default="",
-                        help="branch for k_line; blank for k_load")
-    parser.add_argument("--mode", default="scale")
+                        help="branch for k_line, injector for k_gen; blank "
+                             "for k_load")
+    parser.add_argument("--mode", default="scale",
+                        help="scale for k_line and k_load; for k_gen, derate "
+                             "(an absolute MW cap on a unit with no "
+                             "availability schedule) or avail (a factor on a "
+                             "unit that has one)")
     parser.add_argument("--kmin", type=float, required=True)
     parser.add_argument("--kmax", type=float, required=True)
     parser.add_argument("--kstep", type=float, required=True)
@@ -2076,7 +2387,7 @@ def _roots(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
 
 def _print_plan(plan: SweepPlan, projected: Dict[str, float]) -> None:
-    witness = WITNESSES[plan.lever]
+    witness = plan.witness
     print(SECTION_SEPARATOR, end="")
     print("ercot7k sweep plan -- %s" % plan.sweep_id)
     print(SECTION_SEPARATOR, end="")
