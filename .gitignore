@@ -107,6 +107,13 @@ ercot7k_config/*.csv
 # EXCEPT the ercot7k PSO case inputs (input tables, not generated)
 !ercot7k/
 !ercot7k/**
+
+# EXCEPT the case's side-cars (bus coordinates, source manifest) and the
+# datacenter injector templates -- inputs, not generated
+!ercot7k_geo/
+!ercot7k_geo/**
+!injector_templates/
+!injector_templates/**
 # Ignore run output if a run is written into the case dir
 ercot7k/logs/
 ercot7k/results/
