@@ -90,7 +90,7 @@ def mini_spec(node: str = MONITORED_NODE, **overrides) -> ec.DatacenterSpec:
 # ------------------------------------------------------------------------------
 def test_round_trip_of_the_real_case_is_byte_identical():
     files = ec.case_csv_files(BASE_DIR)
-    assert len(files) == 24, "the ercot7k case is 24 CSV files"
+    assert len(files) == 29, "the ercot7k case is 29 CSV files"
     for path in files:
         table = ec.read_table(path)
         assert table.to_bytes() == path.read_bytes(), path.name
@@ -133,12 +133,12 @@ def test_round_trip_through_the_filesystem_is_byte_identical(tmp_path: Path):
 
 
 def test_field_text_is_never_reserialized():
-    """746.000 must not become 746.0, on any of 634 rows."""
+    """295.000 must not become 295.0, on any of 1063 rows."""
     table = ec.read_table(BASE_DIR / "texas7k_INJ_ID.csv")
     records = table.records()
-    assert records[0]["MaxMw"] == "746.000"
+    assert records[0]["MaxMw"] == "295.000"
     assert records[0]["MinMw"] == "0.000"
-    assert records[0]["RaiseRR"] == "22.380"
+    assert records[0]["RaiseRR"] == "8.850"
     net = ec.read_table(BASE_DIR / "texas7k_INJ_NET.csv")
     assert net.records()[0]["LossFactor"] == "0.00000000"
 
@@ -150,12 +150,20 @@ def test_schema_is_introspected_from_the_file_not_hardcoded():
     assert len(table.columns) == 15
 
 
-def test_a_crlf_file_keeps_its_crlf():
-    """CYC_SAI is the one CRLF file in the case; it must stay that way."""
-    path = BASE_DIR / "texas7k_CYC_SAI.csv"
-    raw = path.read_bytes()
-    assert b"\r\n" in raw
+def test_a_crlf_file_keeps_its_crlf(tmp_path: Path):
+    """
+    A CRLF file must round-trip as CRLF. The 2018 case shipped one (CYC_SAI);
+    the 2030 WA case is all LF, so the file is built here rather than found.
+    """
+    path = tmp_path / "texas7k_CYC_SAI.csv"
+    raw = (b"Cycle,PriorCycle,RunAnalysis\r\n"
+           b"SC,,1\r\n"
+           b"DA,SC,1\r\n")
+    path.write_bytes(raw)
     assert ec.read_table(path).to_bytes() == raw
+    target = tmp_path / "copy.csv"
+    ec.write_table(ec.read_table(path), target)
+    assert target.read_bytes() == raw
 
 
 def test_reading_a_non_ascii_file_is_refused(tmp_path: Path):
@@ -935,8 +943,9 @@ def test_verify_case_passes_clean_on_the_fixture():
 
 
 @pytest.mark.parametrize("node,why", [
-    # The study node: HEWITT 3, import side of the branch that binds in 69 of
-    # the 168 RT intervals, so load here deepens a live constraint.
+    # The study node: HEWITT 3, import side of the branch that bound in 69 of
+    # the 168 RT intervals of the 2018 case, so load here deepened a live
+    # constraint. Not yet re-measured on the 2030 WA case.
     ("N210144", "congested pocket"),
     # BAY CITY 3, the old template default: a real 345 kV node on monitored
     # branches that never binds. Kept as a control -- a layer there must still
@@ -960,13 +969,13 @@ def test_a_real_datacenter_layer_off_ercot7k_verifies_clean(
             required, ec.format_findings(findings))
 
     injectors = ec.read_table(layer / "texas7k_INJ_ID.csv").records()
-    assert len(injectors) == 636
+    assert len(injectors) == 1065
     assert manifest["study"]["datacenters"][0]["pin_mechanism"] == (
         "scn_inj_dsp_fixed")
     expected = manifest["study"]["datacenters"][0]["expected_dc_mw_by_interval"]
-    assert len(expected) == 265
-    assert expected["2018.04.06 00:00"] == 1000.0
-    assert expected["2018.04.17 00:00"] == 1000.0
+    assert len(expected) == 385
+    assert expected["2026.06.12 00:00"] == 1000.0
+    assert expected["2026.06.28 00:00"] == 1000.0
 
 
 def test_the_datacenter_load_spans_the_whole_of_min_to_max_date():
@@ -976,7 +985,7 @@ def test_the_datacenter_load_spans_the_whole_of_min_to_max_date():
     mdl = ec.model_id(tables)
     assert points[0] == mdl["MinDate"]
     assert points[-1] == mdl["MaxDate"]
-    assert len(points) == 265
+    assert len(points) == 385
     assert mdl["StartDate"] != mdl["MinDate"]
     assert mdl["StopDate"] != mdl["MaxDate"]
 

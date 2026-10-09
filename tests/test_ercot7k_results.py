@@ -73,8 +73,9 @@ MINI_DIR = REPO_ROOT / "tests" / "fixtures" / "mini7k"
 REFERENCE_RUN = (REPO_ROOT / "devnet-reference-runs"
                  / "devnetDC-sld-27Aug2026" / "stress_out")
 
-# The complete validated run of the exact shipped case, read-only, and 442 MB,
-# which is why it is not in the repo. Everything in this module is measured
+# The complete validated run of the 2018 Texas7k case that ercot7k/ shipped
+# until the 2030 WA swap, read-only, and 442 MB, which is why it is not in the
+# repo. Everything in this module is measured
 # against it rather than against a brief.
 #
 # Set ERCOT7K_REAL_RESULTS to the results/ directory of your own full-cycle run
@@ -88,6 +89,14 @@ REAL_RESULTS = Path(
     or REPO_ROOT.parent / "ercot-public-dataset" / "pso"
     / "texas7k_fullcycle" / "results"
 )
+
+# The case that PRODUCED that run, which is no longer ercot7k/. Since the swap
+# to the 2030 WA case, ercot7k/ has different injectors, nodes and dates, and
+# pairing it with a 2018 run fails on all three. Every constant below was
+# measured on the 2018 run, so the case read beside it must be the 2018 case:
+# by default the directory the results sit in. Its cost-curve tables (CCV_*)
+# moved after this run was made; nothing here reads them.
+REAL_CASE = Path(os.environ.get("ERCOT7K_REAL_CASE") or REAL_RESULTS.parent)
 
 # Measured on the real run, not taken from a brief. Every one of these is a
 # number the mapper would happily report wrong.
@@ -125,10 +134,11 @@ REAL_REPORTED_INTERVALS = (73, 240)
 REAL_LOAD_FACTOR_RAW_SUM = 1.13204781007
 
 pytestmark = pytest.mark.skipif(
-    not REAL_RESULTS.is_dir(),
-    reason=("no validated PSO run at %s -- set ERCOT7K_REAL_RESULTS to the "
-            "results/ directory of a full-cycle run of ercot7k/. These tests "
-            "are SKIPPED, not passed." % REAL_RESULTS),
+    not REAL_RESULTS.is_dir()
+    or not (REAL_CASE / "texas7k_MDL_ID.csv").is_file(),
+    reason=("no validated PSO run at %s, or no case beside it at %s -- set "
+            "ERCOT7K_REAL_RESULTS and ERCOT7K_REAL_CASE. These tests are "
+            "SKIPPED, not passed." % (REAL_RESULTS, REAL_CASE)),
 )
 
 
@@ -146,7 +156,7 @@ def real_run(real_key: er.ReportKey) -> er.MappedRun:
     """One full map of the real run. Module-scoped: it reads 400 MB."""
     return er.map_results(REAL_RESULTS, interval=real_key.interval,
                           cycle=real_key.cycle, scenario=real_key.scenario,
-                          case_dir=BASE_DIR)
+                          case_dir=REAL_CASE)
 
 
 def read_csv_rows(path: Path) -> list:
@@ -427,7 +437,7 @@ def test_the_injector_scan_matches_the_cases_injector_count(
     scan = er.scan_injectors(REAL_RESULTS, real_key)
     injectors = {r["Injector"]
                  for r in ec.read_table(
-                     BASE_DIR / "texas7k_INJ_ID.csv").records()}
+                     REAL_CASE / "texas7k_INJ_ID.csv").records()}
     assert set(scan.dispatch) == injectors
     assert len(scan.dispatch) == 634
 
@@ -479,7 +489,7 @@ def test_bus_net_import_is_positive_at_exactly_the_load_nodes(
     net = real_run.summary["bus_net_import_mw"]
     distribution = er.load_distribution(REAL_RESULTS)
     load_nodes = set(distribution.nodes())
-    gen_nodes = set(er.injector_node_map(BASE_DIR).values())
+    gen_nodes = set(er.injector_node_map(REAL_CASE).values())
     for node in load_nodes - gen_nodes:
         assert net[node] > 0.0, "%s carries load and no generation" % node
     for node in gen_nodes - load_nodes:
@@ -564,7 +574,7 @@ def test_the_interval_datetime_counts_from_mindate_not_startdate(
     # hours later, and the first reported interval is 73. Interval 184 is
     # therefore 183 hours after MinDate.
     assert real_run.summary["datetime"] == "2018-04-13 15:00"
-    clock = er.interval_clock(BASE_DIR)
+    clock = er.interval_clock(REAL_CASE)
     assert clock is not None
     assert clock.text(1) == "2018-04-06 00:00"
     assert clock.text(REAL_REPORTED_INTERVALS[0]) == "2018-04-09 00:00"
@@ -578,7 +588,7 @@ def test_the_default_datacenter_node_sits_behind_a_binding_constraint():
     no congestion response, no asymptote, nothing for BYOG to displace. That
     was the old default, and it is the control case here.
     """
-    brn = ec.read_table(BASE_DIR / "texas7k_BRN_ID.csv").records()
+    brn = ec.read_table(REAL_CASE / "texas7k_BRN_ID.csv").records()
     nodes = {DEFAULT_DC_NODE, QUIET_CONTROL_NODE}
     touching = {n: [b for b in brn
                     if n in (b["FrEnode"], b["ToEnode"])] for n in nodes}
@@ -617,7 +627,7 @@ def test_dispatch_sums_to_the_area_load_because_the_base_has_no_load_injector(
     total = sum(real_run.summary["generator_dispatch_mw"].values())
     assert total == pytest.approx(REAL_PEAK_LOAD_MW, abs=0.01)
     load_flags = {r["LoadFlag"] for r in ec.read_table(
-        BASE_DIR / "texas7k_INJ_ID.csv").records()}
+        REAL_CASE / "texas7k_INJ_ID.csv").records()}
     assert load_flags == {"0"}
 
 
@@ -796,7 +806,7 @@ def test_mapping_twice_is_byte_identical(tmp_path: Path):
     second = tmp_path / "b"
     for outdir in (first, second):
         run = er.map_results(REAL_RESULTS, interval=REAL_PEAK_INTERVAL,
-                             cycle="RT", scenario="ScnRT", case_dir=BASE_DIR)
+                             cycle="RT", scenario="ScnRT", case_dir=REAL_CASE)
         er.write_artifacts(outdir, "t", run)
         (outdir / "dash.md").write_text(er.dashboard_text(run, "t"),
                                         encoding="ascii")
@@ -1216,8 +1226,13 @@ def test_the_cli_pins_into_the_cases_study_json_and_maps_from_it(
         tmp_path: Path, capsys):
     # study.json lives next to the case, which is what makes the pin travel
     # with the case rather than with whoever typed the command.
+    # Inputs only: the case directory also holds the run's results/ (400 MB),
+    # and a study.json already in it would refuse the pin under test.
     case = tmp_path / "ercot7k"
-    shutil.copytree(BASE_DIR, case)
+    case.mkdir()
+    for path in ec.case_files(REAL_CASE):
+        if path.name != er.study_path(REAL_CASE).name:
+            shutil.copy2(path, case / path.name)
 
     assert er.main(["pin", str(REAL_RESULTS), "--case-dir", str(case)]) == 0
     out = capsys.readouterr().out
