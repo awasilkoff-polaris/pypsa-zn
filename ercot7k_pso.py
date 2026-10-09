@@ -127,6 +127,12 @@ def read_cyc_list(cyc_id_path: str) -> list[str]:
 # Filtering to one cycle and peaking over intervals gives a real MW number:
 # ~46,795 MW on the RT cycle of the shipped ercot7k week.
 #
+# Area "0" is PSO's system aggregate, not an area. A single-area case reports
+# only that row; a case with an ARA_ID (the 2030 WA case: eight weather zones)
+# reports the zones AND the aggregate, and summing every row double-counts --
+# 165,184 MW where the real RT peak is 82,592. So an interval with an area-0
+# row takes that row alone, and one without sums its areas.
+#
 # Returns None if the file is missing (caller treats that as FAILED). This is
 # the "verify a real value" check: a zero/missing peak is a failed run
 # regardless of what StartupDataID()'s return value or the exit status say.
@@ -144,13 +150,19 @@ def peak_served_load(results_dir: str, cycle: str = "") -> float | None:
         # (e.g. "//cyc"), so match on position rather than on a literal name.
         cyc_field = fields[0] if fields else ""
         by_interval = {}
+        system_total = {}
 
         for row in reader:
             if cycle and cyc_field and row.get(cyc_field) != cycle:
                 continue
             key = row.get("int") if "int" in fields else id(row)
-            by_interval[key] = by_interval.get(key, 0.0) + float(row.get("Load", 0.0) or 0.0)
+            load = float(row.get("Load", 0.0) or 0.0)
+            if row.get("ara") == "0":
+                system_total[key] = system_total.get(key, 0.0) + load
+            else:
+                by_interval[key] = by_interval.get(key, 0.0) + load
 
+    by_interval.update(system_total)
     return max(by_interval.values()) if by_interval else 0.0
 
 # ------------------------------------------------------------------------------
